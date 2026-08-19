@@ -2354,8 +2354,12 @@ class DashboardState:
                     )
 
                     # ── Stop loss ──
+                    # Short economics: stop_loss sits ABOVE entry (protects against a
+                    # rally), so it triggers when price rises TO/ABOVE it, and
+                    # "recovered" means price fell back BELOW it -- both inverted from
+                    # AITrading's own long-side comparisons.
                     _active_conditions = self._risk_condition_active.setdefault(ticker, set())
-                    if pos.stop_loss > 0 and pos.current_price <= pos.stop_loss:
+                    if pos.stop_loss > 0 and pos.current_price >= pos.stop_loss:
                         _was_active = "stop_loss" in _active_conditions
                         _active_conditions.add("stop_loss")
                         if not _was_active:
@@ -2370,13 +2374,13 @@ class DashboardState:
                                          ticker, _cooldown_until)
                         if ticker not in self.portfolio.positions:
                             continue  # stop-loss already closed the position — skip trailing stop
-                    elif "stop_loss" in _active_conditions and pos.stop_loss > 0 and pos.current_price > pos.stop_loss:
-                        # Recovered back above the stop -- log it once, symmetric to the
+                    elif "stop_loss" in _active_conditions and pos.stop_loss > 0 and pos.current_price < pos.stop_loss:
+                        # Recovered back below the stop -- log it once, symmetric to the
                         # "triggered" message above, then clear so a future re-breach logs
                         # fresh immediately as its own new one-shot.
                         _active_conditions.discard("stop_loss")
                         entry = self.add_ai_log(ticker, "RISK",
-                            f"✅ Price recovered above stop loss (${pos.stop_loss:.2f}) — "
+                            f"✅ Price recovered below stop loss (${pos.stop_loss:.2f}) — "
                             f"now ${pos.current_price:.2f}", "success")
                         await self.broadcast({"type": "ai_log", "entry": entry})
 
@@ -2408,13 +2412,19 @@ class DashboardState:
                         # shows it in parens next to the stop figure) — it is NOT used to
                         # decide anything; the actual trailing_stop price below is always
                         # recomputed fresh from trail_pct_value directly.
-                        start_pct = _derive_stop_pct(
+                        # Short economics (2026-08-19): profit as price FALLS below
+                        # entry, trailing stop sits ABOVE price and ratchets DOWN as
+                        # profit grows, triggers when price rises back UP through it --
+                        # every comparison below is the mirror of AITrading's own
+                        # long-side logic. See docs/superpowers/specs/
+                        # 2026-08-19-aishorttrading-design.md.
+                        start_pct = _short_derive_stop_pct(
                             pos.entry_price, pos.stop_loss,
                             self.config["take_profit"].get("stop_loss_pct", 5.0))
                         final_trail_pct = self.config["take_profit"].get(
                             "final_tranche_trail_pct", 0.5)
                         t3_price = pos.take_profit_targets[-1] if pos.take_profit_targets else None
-                        graduated_pct = _graduated_trail_pct(
+                        graduated_pct = _short_graduated_trail_pct(
                             pos.entry_price, pos.current_price, start_pct, final_trail_pct,
                             pos.t1_target_price, pos.t2_target_price, t3_price,
                             self.config["risk_management"].get(
@@ -2423,23 +2433,22 @@ class DashboardState:
                             pos.profit_target_hit,
                             self.config["take_profit"].get("dollar_target_trail_pct", 1.0),
                             graduated_pct)
-                        trail_pct = 1 - (trail_pct_value / 100)
+                        short_trail_multiplier = 1 + (trail_pct_value / 100)
                         self._trailing_stop_pct_display[ticker] = round(trail_pct_value, 2)
                         if pos.trailing_stop is None:
-                            # Arm the moment the position goes positive (2026-07-23,
-                            # replaces the old >5%-gain gate) -- the standing hard stop_loss
-                            # order is unaffected either way; this only changes when this
-                            # second, ratcheting layer starts contributing.
-                            if pos.current_price > pos.entry_price:
-                                pos.trailing_stop = pos.current_price * trail_pct
+                            # Arm the moment the position goes positive -- price has
+                            # fallen below entry for a short.
+                            if pos.current_price < pos.entry_price:
+                                pos.trailing_stop = pos.current_price * short_trail_multiplier
                                 await self.portfolio._save_position(pos)
                         else:
-                            # Already trailing — ratchet up only, using the current graduated trail_pct
-                            new_trailing = pos.current_price * trail_pct
-                            if new_trailing > pos.trailing_stop:
+                            # Already trailing — ratchet DOWN only, using the current
+                            # graduated trail_pct.
+                            new_trailing = pos.current_price * short_trail_multiplier
+                            if new_trailing < pos.trailing_stop:
                                 pos.trailing_stop = new_trailing
                                 await self.portfolio._save_position(pos)
-                        if pos.trailing_stop is not None and pos.current_price <= pos.trailing_stop:
+                        if pos.trailing_stop is not None and pos.current_price >= pos.trailing_stop:
                             _was_active = "trailing_stop" in _active_conditions
                             _active_conditions.add("trailing_stop")
                             _pt_hit = pos.profit_target_hit
@@ -2460,10 +2469,10 @@ class DashboardState:
                             if ticker not in self.portfolio.positions:
                                 continue  # trailing stop closed the position — skip conviction-drop
                         elif ("trailing_stop" in _active_conditions and pos.trailing_stop is not None
-                                and pos.current_price > pos.trailing_stop):
+                                and pos.current_price < pos.trailing_stop):
                             _active_conditions.discard("trailing_stop")
                             entry = self.add_ai_log(ticker, "RISK",
-                                f"✅ Price recovered above trailing stop (${pos.trailing_stop:.2f}) — "
+                                f"✅ Price recovered below trailing stop (${pos.trailing_stop:.2f}) — "
                                 f"now ${pos.current_price:.2f}", "success")
                             await self.broadcast({"type": "ai_log", "entry": entry})
 
@@ -2485,16 +2494,21 @@ class DashboardState:
                                 and self._is_position_profitable_enough_to_skip(pos)):
                             proximity = self.config["research"].get(
                                 "position_monitor_event_proximity_pct", 2.0) / 100
+                            # Short economics: trailing_stop sits ABOVE price, so
+                            # "nearing" it means price is just BELOW, within proximity%
+                            # (mirror of the long-side "just above" check). A target
+                            # sits BELOW price, so "nearing" it means price is just
+                            # ABOVE, within proximity%.
                             nearing_stop = (
                                 pos.trailing_stop is not None
-                                and pos.current_price > pos.trailing_stop
-                                and pos.current_price <= pos.trailing_stop * (1 + proximity)
+                                and pos.current_price < pos.trailing_stop
+                                and pos.current_price >= pos.trailing_stop * (1 - proximity)
                             )
                             next_target = pos.take_profit_targets[0] if pos.take_profit_targets else None
                             nearing_target = (
                                 next_target is not None
-                                and pos.current_price < next_target
-                                and pos.current_price >= next_target * (1 - proximity)
+                                and pos.current_price > next_target
+                                and pos.current_price <= next_target * (1 + proximity)
                             )
                             if nearing_stop or nearing_target:
                                 _cd = self._event_monitor_cooldown.get(ticker)

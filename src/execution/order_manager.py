@@ -68,6 +68,18 @@ def _classify_stop_exit_reason(fill_price: float, entry_price: float, profit_tar
     return "Stop loss hit"
 
 
+def _short_effective_stop(stop_loss: float, trailing_stop: float | None) -> float:
+    """Short-side mirror of AITrading's own max(stop_loss, trailing_stop or 0): for a
+    short, the stop sits ABOVE price and the trailing stop only ever ratchets DOWN
+    (tightening toward price as profit grows), so the more protective value is the
+    LOWER of the two -- min(), not max(). The long version's "or 0" fallback doesn't
+    translate to min (min(x, 0) would wrongly always win), so None is handled
+    explicitly instead."""
+    if trailing_stop is None:
+        return stop_loss
+    return min(stop_loss, trailing_stop)
+
+
 def _compute_tranche_split(shares: float, targets: list[float]):
     """Pure tranche-size math. Originally computed a stop/TP split for
     _place_exit_orders' former inline branching; since the 2026-08-11 redesign (stop
@@ -1574,7 +1586,7 @@ class OrderManager:
                 open_orders = []
         for o in open_orders:
             # Never cancel a pending market sell — that's an active close attempt
-            if o["ticker"] == ticker and o["side"] == "sell" and o["type"] != "market":
+            if o["ticker"] == ticker and o["side"] == "buy" and o["type"] != "market":
                 await self.broker.cancel_order(o["order_id"])
         # Also clear the local stop tracking entry (may overlap with above — cancel is
         # idempotent). No take-profit dict to clear anymore (2026-08-11 redesign) --
@@ -1615,9 +1627,10 @@ class OrderManager:
             )
         try:
             market_order = Order(
-                ticker=ticker, side=OrderSide.SELL,
+                ticker=ticker, side=OrderSide.BUY,
                 order_type=OrderType.MARKET,
                 quantity=round(remaining_shares, 9),
+                position_intent="buy_to_close",
             )
             result = await self.broker.submit_order(market_order)
             self.active_orders[result.broker_order_id] = result
@@ -1657,7 +1670,7 @@ class OrderManager:
         stop_order = stop_orders.get(pos.ticker)
         if stop_order is None:
             return False
-        intended_stop = round(max(pos.stop_loss, pos.trailing_stop or 0), 2)
+        intended_stop = round(_short_effective_stop(pos.stop_loss, pos.trailing_stop), 2)
         stop_price_ok = (
             stop_order.get("stop_price") is not None
             and abs(round(stop_order["stop_price"], 2) - intended_stop) < 0.005
@@ -1687,9 +1700,9 @@ class OrderManager:
             return []
 
         stop_orders = {o["ticker"]: o for o in open_orders
-                       if o["side"] == "sell" and o["type"] in ("stop", "stop_limit")}
+                       if o["side"] == "buy" and o["type"] in ("stop", "stop_limit")}
         pending_market_sell = {o["ticker"] for o in open_orders
-                                if o["side"] == "sell" and o["type"] == "market"}
+                                if o["side"] == "buy" and o["type"] == "market"}
 
         gaps: list[dict] = []
         for ticker, pos in list(self.portfolio.positions.items()):
@@ -1733,7 +1746,7 @@ class OrderManager:
         must fall back to the existing cancel+place path)."""
         if not existing_stop or not hasattr(self.broker, "replace_order"):
             return False
-        intended_stop = round(max(pos.stop_loss, pos.trailing_stop or 0), 2)
+        intended_stop = round(_short_effective_stop(pos.stop_loss, pos.trailing_stop), 2)
         current_stop_price = existing_stop.get("stop_price")
         if current_stop_price is not None and abs(round(current_stop_price, 2) - intended_stop) < 0.005:
             # Price is already correct -- whatever made this ticker "not covered" isn't a
@@ -1811,7 +1824,7 @@ class OrderManager:
                 # as covered, or it silently never gets updated to reflect the current
                 # protective level.
                 stop_orders = {o["ticker"]: o for o in open_orders
-                               if o["side"] == "sell" and o["type"] in ("stop", "stop_limit")}
+                               if o["side"] == "buy" and o["type"] in ("stop", "stop_limit")}
                 for ticker, pos in list(self.portfolio.positions.items()):
                     # Shared with check_protection_gaps' 10s read-only verification
                     # (2026-07-21) — one source of truth for "is this position covered."
@@ -1840,7 +1853,7 @@ class OrderManager:
                     # resting partial sell is left alone either way.
                     pending_market_sell_qty = sum(
                         o.get("qty") or 0.0 for o in open_orders
-                        if o["ticker"] == ticker and o["side"] == "sell" and o["type"] == "market"
+                        if o["ticker"] == ticker and o["side"] == "buy" and o["type"] == "market"
                     )
                     if pending_market_sell_qty >= pos.shares - 0.001:
                         logger.debug(
@@ -1886,7 +1899,7 @@ class OrderManager:
                         # Use whichever is higher: original stop or trailing stop.
                         # Trailing stop only moves up, so this safely ratchets the
                         # Alpaca hard stop to reflect locked-in profit protection.
-                        effective_stop = max(pos.stop_loss, pos.trailing_stop or 0)
+                        effective_stop = _short_effective_stop(pos.stop_loss, pos.trailing_stop)
                         # Try the routine "stop exists, just needs a fresh price" case via an
                         # in-place replace first (2026-07-28) -- Alpaca's own documented way
                         # to adjust an existing order's price, and it sidesteps the cancel+
@@ -2010,7 +2023,7 @@ class OrderManager:
         for ticker, pos in list(self.portfolio.positions.items()):
             if len(pos.take_profit_targets) < 2:
                 continue
-            if pos.current_price is None or pos.current_price < pos.take_profit_targets[0]:
+            if pos.current_price is None or pos.current_price > pos.take_profit_targets[0]:
                 continue
             await self._execute_take_profit_tranche(ticker)
 
@@ -2060,9 +2073,10 @@ class OrderManager:
             sell_qty = round(tranche_shares, 9)
             try:
                 tp_order = Order(
-                    ticker=ticker, side=OrderSide.SELL,
+                    ticker=ticker, side=OrderSide.BUY,
                     order_type=OrderType.MARKET,
                     quantity=sell_qty,
+                    position_intent="buy_to_close",
                 )
                 result = await self.broker.submit_order(tp_order)
                 self.active_orders[result.broker_order_id] = result
@@ -2084,9 +2098,10 @@ class OrderManager:
                         await asyncio.sleep(2)
                     try:
                         tp_order = Order(
-                            ticker=ticker, side=OrderSide.SELL,
+                            ticker=ticker, side=OrderSide.BUY,
                             order_type=OrderType.MARKET,
                             quantity=sell_qty,
+                            position_intent="buy_to_close",
                         )
                         result = await self.broker.submit_order(tp_order)
                         self.active_orders[result.broker_order_id] = result
@@ -2103,7 +2118,7 @@ class OrderManager:
                         tranche_number, ticker, e,
                     )
                     await self._place_stop_only(
-                        ticker, pos.shares, max(pos.stop_loss, pos.trailing_stop or 0))
+                        ticker, pos.shares, _short_effective_stop(pos.stop_loss, pos.trailing_stop))
                     return False
             tranche_shares = sell_qty
 
@@ -2113,8 +2128,12 @@ class OrderManager:
             # doesn't, the last known quote is the best available honest estimate.
             fill_price = result.filled_price if result.filled_price is not None else pos.current_price
             entry_price = pos.entry_price
-            pnl = (fill_price - entry_price) * tranche_shares
-            self.portfolio.cash += tranche_shares * fill_price
+            # Short economics (2026-08-19): profit on covering is (entry - fill), not
+            # (fill - entry) -- and covering SPENDS cash to buy the shares back, it
+            # never credits it. This was a real cash-accounting bug, not just a P&L
+            # sign flip, if shipped as a direct copy of the long-side logic.
+            pnl = (entry_price - fill_price) * tranche_shares
+            self.portfolio.cash -= tranche_shares * fill_price
             pos.realized_pnl += pnl
             pos.shares_sold += tranche_shares
             pos.shares = round(pos.shares - tranche_shares, 9)
@@ -2167,7 +2186,7 @@ class OrderManager:
                 return True
 
             stop_placed = await self._place_stop_only(
-                ticker, pos.shares, max(pos.stop_loss, pos.trailing_stop or 0))
+                ticker, pos.shares, _short_effective_stop(pos.stop_loss, pos.trailing_stop))
             if not stop_placed:
                 logger.error(
                     "%s: fresh 100%% stop failed to place after TP T%d — position "
