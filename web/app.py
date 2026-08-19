@@ -176,6 +176,7 @@ if not _SESSION_SECRET_KEY or not _DASHBOARD_PASSWORD:
 
 _LOGIN_PAGE_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/static/icon-192.png" type="image/png">
 <title>Doug's AIShortTrading — Login</title>
 <style>
   body { background:#0a0e17; color:#e5e7eb; font-family:system-ui,-apple-system,sans-serif;
@@ -508,6 +509,24 @@ def _dip_low_changed_meaningfully(old_low: float | None, new_low: float, refresh
     return (old_low - new_low) / old_low * 100 >= refresh_pct
 
 
+def _dip_peak_changed_meaningfully(old_peak: float | None, new_peak: float, refresh_pct: float) -> bool:
+    """Short-side mirror of _dip_low_changed_meaningfully (2026-08-19): the AI-entry
+    reference point this system tracks is now the RALLY PEAK a short recommendation was
+    reasoned from, not a dip low -- a genuinely new, HIGHER peak is what invalidates a
+    prior recommendation (it was reasoned from a now-outdated top), the inverse of a
+    genuinely deeper low doing the same for a long-side dip-recovery system. Same
+    noise-filtering purpose: an ordinary few cents of drift as the observation window
+    slides shouldn't burn a fresh, real Claude call for essentially the same answer.
+    Returns True only if new_peak is at least refresh_pct% above old_peak. A missing or
+    invalid old_peak (no recommendation exists yet) always counts as meaningfully
+    different, and a new_peak that hasn't actually gotten higher never does."""
+    if old_peak is None or old_peak <= 0:
+        return True
+    if new_peak <= old_peak:
+        return False
+    return (new_peak - old_peak) / old_peak * 100 >= refresh_pct
+
+
 def _ai_entry_initially_armed(price: float, ai_entry_price: float, arm_band_pct: float) -> bool:
     """Whether price counts as "close enough" to ai_entry_price to arm the promotion
     trigger -- shared threshold formula used both for a freshly-computed recommendation's
@@ -561,6 +580,47 @@ def _ai_entry_trigger(
     if price < ai_entry_price:
         return False, seen_below
     return seen_below, seen_below
+
+
+def _short_ai_entry_initially_armed(price: float, ai_entry_price: float, arm_band_pct: float) -> bool:
+    """Short-side mirror of _ai_entry_initially_armed (2026-08-19): the AI-recommended
+    short entry sits near a RESISTANCE level, so "close enough to arm" means price is
+    already at/above that entry (or within arm_band_pct% below it), not at/below it.
+    0 (default) requires price to be strictly at/above the entry itself."""
+    return price > ai_entry_price * (1 - arm_band_pct / 100)
+
+
+def _short_ai_entry_trigger(
+    price: float, ai_entry_price: float, seen_above: bool, arm_band_pct: float = 0.0,
+) -> tuple[bool, bool]:
+    """Short-side mirror of _ai_entry_trigger (2026-08-19, the DV-incident fix): requires a
+    genuine FALL DOWN THROUGH ai_entry_price, not merely already sitting at/below it.
+
+    Claude is asked for a good SHORT entry PRICE, not necessarily one below the current
+    price -- it commonly recommends a resistance level ABOVE where price has already
+    rolled over to by the time the recommendation is computed. The mirror of the DV
+    incident: reasoning about a peak from days ago and recommending entry $10.65 "near
+    resistance" while price has ALREADY fallen to $9.90 by the time the recommendation is
+    made would, under a naive `price <= ai_entry_price` trigger, sell short immediately at
+    the current market price -- well below the level Claude actually reasoned about --
+    instead of ever waiting for a real bounce back up to it.
+
+    Requires seen_above to have been True at some point (price observed close enough to
+    the entry since the recommendation was made) before price reaching/crossing DOWN
+    through the entry counts as a real signal. A recommendation where price is already
+    at/above the entry (or within arm_band_pct% below it) at computation time starts
+    pre-armed, matching the ordinary "waiting for it to fall" case this feature is
+    designed for; one where price is already well below the entry starts unarmed and
+    requires price to genuinely approach the entry first.
+
+    Returns (should_promote, updated_seen_above) — the caller stores the second value
+    back onto the candidate regardless of the first, since "price got close enough to the
+    entry" is itself worth remembering even on a tick that doesn't yet promote."""
+    if _short_ai_entry_initially_armed(price, ai_entry_price, arm_band_pct):
+        seen_above = True
+    if price > ai_entry_price:
+        return False, seen_above
+    return seen_above, seen_above
 
 
 def _not_yet_analyzed_today(report: dict | None, today_str: str) -> bool:
@@ -767,6 +827,29 @@ def _dip_recovery_dedup_cleared(
     return current_price >= failed_at_price * (1 + recovery_retry_pct / 100)
 
 
+def _dip_rollover_dedup_cleared(
+    failed_peak: float | None, current_peak: float,
+    failed_at_price: float | None, current_price: float,
+    recovery_retry_pct: float,
+) -> bool:
+    """Short-side mirror of _dip_recovery_dedup_cleared (2026-08-19): the tracked
+    reference point for a promotion attempt is now the rally PEAK a short setup rolled
+    over from, not a dip low, and "recovering further" means price falling FURTHER below
+    the level where the last attempt failed, not rising further above it.
+
+    Returns True (a fresh attempt IS allowed) if EITHER the peak has genuinely moved (a
+    new, higher peak forming is real new information on its own, regardless of price), OR
+    price has fallen at least recovery_retry_pct% further below the price recorded at the
+    moment of the last failed attempt. Returns False (stay deduped) if the peak is
+    unchanged and either there's no recorded failed-attempt price to compare against (a
+    candidate that predates this field) or price hasn't fallen far enough past it yet."""
+    if failed_peak is None or failed_peak != current_peak:
+        return True
+    if failed_at_price is None or failed_at_price <= 0:
+        return False
+    return current_price <= failed_at_price * (1 - recovery_retry_pct / 100)
+
+
 def _dip_low_too_stale(low_t: float, now_ts: float, max_age_days: float) -> bool:
     """Whether dip_summary's tracked low is too old to represent a genuine, CURRENT dip
     (2026-07-28, RRC/OVV incident) — the mechanical "retracement" on_deck_entry_mode's own
@@ -790,18 +873,21 @@ def _dip_low_too_stale(low_t: float, now_ts: float, max_age_days: float) -> bool
 def _price_clears_block_breakout(
     current_price: float, ref_peak: float | None, breakout_pct: float,
 ) -> bool:
-    """Whether a manually-removed On Deck ticker has demonstrably broken out of its stale
-    situation, for free (2026-07-29, FNB discussion) -- user pushback on the removal
+    """Whether a manually-removed On Deck ticker has demonstrably broken DOWN out of its
+    stale situation, for free (2026-07-29, FNB discussion) -- user pushback on the removal
     dialog's blunt "N days"/permanent block: "can we use no cost price adjustments to see
-    if its out of the long dip?" ref_peak is the resistance level (the dip_summary peak,
-    or the ticker's own price if no dip was tracked) captured at removal time -- clearing
-    it by a real margin, not just noise, confirms the stock is no longer stuck recovering
-    toward that old level. None/zero/negative ref_peak means no reference was ever
-    captured (e.g. no price history existed yet at removal time) -- can't auto-clear,
-    falls back to the existing time-based block only."""
+    if its out of the long dip?" Short economics (2026-08-19): ref_peak (kept as the same
+    dict/param name for minimal blast radius, though it now stores a LOW, not a high --
+    mirrors how ai_entry_low_ref tracks a peak elsewhere in this file) is the support
+    level (_recent_window_low, or the ticker's own price if no history was tracked)
+    captured at removal time -- clearing it by a real margin, not just noise, confirms
+    the stock is genuinely breaking down rather than stuck near that old level.
+    None/zero/negative ref_peak means no reference was ever captured (e.g. no price
+    history existed yet at removal time) -- can't auto-clear, falls back to the existing
+    time-based block only."""
     if ref_peak is None or ref_peak <= 0:
         return False
-    return current_price >= ref_peak * (1 + breakout_pct / 100)
+    return current_price <= ref_peak * (1 - breakout_pct / 100)
 
 
 def _normalize_block_entry(raw) -> dict:
@@ -1387,8 +1473,8 @@ class DashboardState:
         # Rebuilt fresh every pre-open scan (cleared at the top of _run_pre_open_batch).
         # Monitored for free (yfinance, no Claude) during market hours by
         # near_miss_monitor_loop; promoted straight to a buy (not the watchlist) when
-        # R/R recovers past the gate AND a confirmed uptick shows the price has
-        # actually stopped falling. See CLAUDE.md "Near-Miss Candidates" for the design.
+        # R/R recovers past the gate AND a confirmed downtick shows the price has
+        # actually stopped rising. See CLAUDE.md "Near-Miss Candidates" for the design.
         self.near_miss_candidates: dict[str, dict] = {}
         # Manual On Deck removals (2026-07-18) — user-initiated, distinct from the automatic
         # conviction-based removal above. ticker -> ISO block-until timestamp, or None for a
@@ -4302,7 +4388,7 @@ class DashboardState:
         nm = self.near_miss_candidates.pop(ticker, None)
         history_days = self.config["research"].get("on_deck_history_days", 30)
         windowed = _windowed_price_history(nm, history_days) if nm else []
-        ref_peak = _recent_window_high(windowed) or (nm.get("last_price") if nm else None)
+        ref_peak = _recent_window_low(windowed) or (nm.get("last_price") if nm else None)
         if permanent:
             self.on_deck_blocked[ticker] = {"until": None, "ref_peak": ref_peak}
             block_desc = "permanently"
@@ -4560,7 +4646,7 @@ class DashboardState:
                 asyncio.create_task(asyncio.to_thread(_save_on_deck_blocked, dict(self.on_deck_blocked)))
                 log_entry = self.add_ai_log(ticker, "ON_DECK",
                     f"Auto-restored to On Deck eligibility — price (${quote.price:.2f}) broke "
-                    f"out above its stale-dip reference peak (${ref_peak:.2f}) by "
+                    f"down below its stale-rally reference low (${ref_peak:.2f}) by "
                     f"{breakout_pct:.1f}%+", "success")
                 await self.broadcast({"type": "ai_log", "entry": log_entry})
 
@@ -4812,173 +4898,175 @@ class DashboardState:
 
                     # Entry-price check (2026-07-18) — see this method's docstring for the
                     # full "retracement" vs "ai" design. Both modes start from the same shared
-                    # peak/low/depth math (dip_summary, src/research/rr_curve.py) rather than a
+                    # low/peak/depth math (dip_summary, src/research/rr_curve.py) rather than a
                     # second copy of it — that same function backs the card-level "here's
                     # what's happening" summary in /api/near-miss, and a second inline copy
                     # here would risk the two drifting out of sync with each other over future
-                    # edits.
+                    # edits. Short economics (2026-08-19): this system watches for a RALLY that
+                    # rolls over, not a dip that recovers -- dip_summary's peak/low still mean
+                    # exactly what they say (peak = highest price found, low = lowest), just
+                    # peak is now the primary anchor. See CLAUDE.md/the design spec for the
+                    # full mirror-image rationale.
                     retracement_pct = self.config["research"].get("on_deck_retracement_pct", 20.0)
-                    # Windowed slice, not the full (now-permanent) price_history — the buy
+                    # Windowed slice, not the full (now-permanent) price_history — the short
                     # decision should only look as far back as on_deck_history_days, even
                     # though the stored history itself is kept forever for display. Built
                     # fresh each tick, never mutates nm["price_history"] itself.
                     windowed_history = [p for p in nm["price_history"] if p[0] >= now_ts - history_window_secs]
                     dip = dip_summary(windowed_history, retracement_pct)
                     if dip is None:
-                        # No measurable peak-to-low dip in this window -- the candidate has
-                        # simply been trending the whole time, with no pullback to confirm a
-                        # recovery from. Second, independent trigger (2026-07-21, user-approved
-                        # after reviewing VLY's case): R/R already enforces "don't overpay" on
-                        # its own (measured against fair_value_estimate regardless of
-                        # dip/no-dip), so the dip-recovery path's real extra job -- confirming
-                        # price has actually stopped falling before buying -- has nothing to
-                        # add for a stock that's already been rising the whole time it's been
-                        # tracked. A large enough % gain off the window's own low is treated as
-                        # a real sustained-uptrend signal here.
+                        # No measurable low-to-peak rally in this window -- the candidate has
+                        # simply been declining the whole time, with no bounce to confirm a
+                        # rollover from. Second, independent trigger (mirrors AITrading's own
+                        # 2026-07-21 no-dip design): R/R already enforces "don't oversell
+                        # relative to fair value" on its own (measured against
+                        # fair_value_estimate regardless of rally/no-rally), so the
+                        # rally-rollover path's real extra job -- confirming price has actually
+                        # stopped rising before shorting -- has nothing to add for a stock
+                        # that's already been falling the whole time it's been tracked. A large
+                        # enough % decline off the window's own high is treated as a real
+                        # sustained-downtrend signal here.
                         #
-                        # Measured as a % gain, not a consecutive-uptick streak (same-day
-                        # revision, 2026-07-21) -- a streak-based version was tried first and
-                        # rejected: a single down tick resets a streak counter to zero
-                        # regardless of how strong the trend was building beforehand (e.g. 9
-                        # straight up-ticks, one down, then 8 more up only reaches streak 8,
-                        # never re-crossing a 10-tick bar), which punishes ordinary noise as
-                        # harshly as a real reversal. % gain off the window low doesn't have
-                        # this problem -- one noisy down tick barely moves the number, so
-                        # genuine sustained progress isn't wiped out by it.
-                        pct_gain_ok = False
-                        low_entry = min(windowed_history, key=lambda p: p[1], default=None)
-                        # Staleness guard (2026-07-29, IVZ incident) -- reuses
-                        # _dip_low_too_stale, originally the mechanical retracement mode's
-                        # own fix for the identical flaw (RRC/OVV, 2026-07-28): measuring
-                        # "gain" off the single lowest price anywhere in the full 30-day
-                        # window, with no check on how old that low actually is, lets a
-                        # stock that's been genuinely declining for days still pass this
-                        # check just because it hasn't yet fallen all the way back down to
-                        # some much older low from weeks ago. Confirmed live: IVZ bought
-                        # while still in a real multi-day decline (a Dip Recovery attempt
-                        # for it had failed 2 days earlier) because today's price was still
-                        # above a stale 30-day window low.
-                        if (low_entry is not None
+                        # Measured as a % loss, not a consecutive-downtick streak (mirrors
+                        # AITrading's own same-day revision) -- a streak-based version punishes
+                        # ordinary noise as harshly as a real reversal: a single up tick resets
+                        # a streak counter to zero regardless of how strong the trend was
+                        # building beforehand. % loss off the window high doesn't have this
+                        # problem -- one noisy up tick barely moves the number, so genuine
+                        # sustained progress isn't wiped out by it.
+                        pct_loss_ok = False
+                        high_entry = max(windowed_history, key=lambda p: p[1], default=None)
+                        # Staleness guard (mirrors AITrading's 2026-07-29 IVZ incident fix) --
+                        # reuses _dip_low_too_stale (pure timestamp-age math, direction-agnostic
+                        # despite its name) against the window's HIGH instead of its low:
+                        # measuring "loss" off the single highest price anywhere in the full
+                        # window, with no check on how old that high actually is, would let a
+                        # stock that's been genuinely rallying for days still pass this check
+                        # just because it hasn't yet risen all the way back up to some much
+                        # older high from weeks ago.
+                        if (high_entry is not None
                                 and not _dip_low_too_stale(
-                                    low_entry[0], now_ts,
+                                    high_entry[0], now_ts,
                                     self.config["research"].get("on_deck_max_dip_low_age_days", 14.0))):
-                            window_low = low_entry[1]
-                            if window_low > 0:
-                                pct_gain = (price - window_low) / window_low * 100
+                            window_high = high_entry[1]
+                            if window_high > 0:
+                                pct_loss = (window_high - price) / window_high * 100
                                 # Stored on the candidate (not just a local variable) so a
                                 # snapshot popped for this attempt carries the exact value that
                                 # triggered it — the finally block below needs it to record
                                 # no_dip_failed_at_pct_gain on a failed attempt.
-                                nm["no_dip_pct_gain"] = round(pct_gain, 2)
+                                nm["no_dip_pct_gain"] = round(pct_loss, 2)
                                 no_dip_pct_gain = self.config["research"].get("on_deck_no_dip_pct_gain", 10.0)
-                                # Dedup mirrors the dip-path's promotion_failed_low: retry only once
-                                # price has risen further past whatever gain the last failed
-                                # attempt saw (real new information), not just because the gain is
-                                # still sitting at the same already-tried level.
-                                pct_gain_ok = (pct_gain >= no_dip_pct_gain
-                                               and pct_gain > nm.get("no_dip_failed_at_pct_gain", 0.0))
+                                # Dedup mirrors the rollover-path's promotion_failed_low: retry
+                                # only once price has fallen further past whatever loss the last
+                                # failed attempt saw (real new information), not just because
+                                # the loss is still sitting at the same already-tried level.
+                                pct_loss_ok = (pct_loss >= no_dip_pct_gain
+                                               and pct_loss > nm.get("no_dip_failed_at_pct_gain", 0.0))
 
-                        # Second, independent no-dip trigger (2026-07-21, user's own design):
-                        # a raw count of upticks out of the last N changes, e.g. 7 out of a
-                        # window of 10 — catches a steady, low-volatility grind that may never
-                        # rack up a large % price gain (the trigger above) but is still a real,
-                        # confirmed uptrend by this different measure. Either trigger alone is
-                        # sufficient; both are independently useful for different price shapes.
-                        up_ratio_ok = False
+                        # Second, independent no-rally trigger (mirrors AITrading's own
+                        # 2026-07-21 design): a raw count of downticks out of the last N
+                        # changes, e.g. 7 out of a window of 10 — catches a steady,
+                        # low-volatility grind down that may never rack up a large % price
+                        # decline (the trigger above) but is still a real, confirmed downtrend
+                        # by this different measure. Either trigger alone is sufficient; both
+                        # are independently useful for different price shapes.
+                        down_ratio_ok = False
                         recent = nm.get("recent_directions", [])
                         up_ratio_window = self.config["research"].get("on_deck_up_ratio_window", 10)
                         if len(recent) >= up_ratio_window:
-                            up_count = sum(1 for d in recent if d == "up")
-                            nm["no_dip_up_count"] = up_count
+                            down_count = sum(1 for d in recent if d == "down")
+                            nm["no_dip_up_count"] = down_count
                             up_ticks_needed = self.config["research"].get("on_deck_up_ticks_needed", 7)
-                            up_ratio_ok = (up_count >= up_ticks_needed
-                                           and up_count > nm.get("no_dip_failed_at_up_count", 0))
+                            down_ratio_ok = (down_count >= up_ticks_needed
+                                             and down_count > nm.get("no_dip_failed_at_up_count", 0))
 
-                        if pct_gain_ok or up_ratio_ok:
+                        if pct_loss_ok or down_ratio_ok:
                             to_promote.append((ticker, None))
                         continue
 
-                    # Don't re-attempt promotion for a dip that already had a failed attempt
+                    # Don't re-attempt promotion for a rally that already had a failed attempt
                     # (2026-07-20) — the trigger condition below (price vs a stored entry
                     # level) has nothing to do with WHY a promotion actually fails (conviction,
                     # signal, R/R on fresh data) — only price. Retrying purely because price is
                     # still elevated would re-run the same fresh Claude check against a
                     # situation that hasn't meaningfully changed, indefinitely. Cleared the
-                    # moment either a genuinely new (deeper) low forms, OR price has recovered
+                    # moment either a genuinely new (higher) peak forms, OR price has fallen
                     # meaningfully further past the level where the last attempt failed
-                    # (2026-07-23 — see _dip_recovery_dedup_cleared for why a plain equality
-                    # check on the low alone left a recovering candidate stuck for hours), or
-                    # the next scheduled persist-check refreshes conviction and resets the
-                    # AI-entry state anyway (see _persist_on_result).
+                    # (mirrors AITrading's 2026-07-23 fix — see _dip_rollover_dedup_cleared for
+                    # why a plain equality check on the peak alone left a rolling-over
+                    # candidate stuck for hours), or the next scheduled persist-check refreshes
+                    # conviction and resets the AI-entry state anyway (see _persist_on_result).
                     recovery_retry_pct = self.config["research"].get("on_deck_recovery_retry_pct", 2.0)
-                    if not _dip_recovery_dedup_cleared(
-                            nm.get("promotion_failed_low"), dip["low"],
+                    if not _dip_rollover_dedup_cleared(
+                            nm.get("promotion_failed_low"), dip["peak"],
                             nm.get("promotion_failed_at_price"), price, recovery_retry_pct):
                         continue
 
                     entry_mode = self.config["research"].get("on_deck_entry_mode", "ai")
                     if entry_mode == "ai":
-                        # Fire a one-time recommendation once a real recovery off the low is
-                        # visible (2+ consecutive upticks) and there isn't already a current
-                        # one for THIS dip low (a MEANINGFULLY deeper low invalidates any
-                        # prior recommendation, since it was reasoned from a now-outdated
-                        # bottom -- see _dip_low_changed_meaningfully for why this isn't a
-                        # plain != comparison: on_deck_ai_entry_low_refresh_pct filters out
-                        # ordinary noise-level drift in the tracked low so it doesn't burn a
-                        # real Claude call for essentially the same answer every cycle).
+                        # Fire a one-time recommendation once a real rollover off the peak is
+                        # visible (2+ consecutive downticks) and there isn't already a current
+                        # one for THIS rally peak (a MEANINGFULLY higher peak invalidates any
+                        # prior recommendation, since it was reasoned from a now-outdated top --
+                        # see _dip_peak_changed_meaningfully for why this isn't a plain !=
+                        # comparison: on_deck_ai_entry_low_refresh_pct filters out ordinary
+                        # noise-level drift in the tracked peak so it doesn't burn a real Claude
+                        # call for essentially the same answer every cycle).
                         refresh_pct = self.config["research"].get(
                             "on_deck_ai_entry_low_refresh_pct", 1.0)
-                        low_changed = _dip_low_changed_meaningfully(
-                            nm.get("ai_entry_low_ref"), dip["low"], refresh_pct)
-                        # Skip re-asking Claude about a low it has already judged
-                        # genuinely stale (2026-07-31, BRO repeat-decline incident) --
+                        peak_changed = _dip_peak_changed_meaningfully(
+                            nm.get("ai_entry_low_ref"), dip["peak"], refresh_pct)
+                        # Skip re-asking Claude about a peak it has already judged genuinely
+                        # stale (mirrors AITrading's 2026-07-31 BRO repeat-decline incident) --
                         # see _save_on_deck_stale_dip_low's docstring. The in-memory
                         # ai_entry_low_ref guard above is wiped the moment a real stale
                         # verdict's auto-eviction removes this candidate's whole
-                        # near_miss_candidates entry, so it can't protect against a
-                        # repeat ask once the candidate is restored -- this separate,
-                        # never-auto-cleared store is what actually survives that cycle.
-                        # Reuses the same "genuinely deeper low" threshold as low_changed
-                        # above; a low that's still essentially the one Claude already
-                        # declined is treated as still-stale for free, mirroring exactly
-                        # what a real repeat call would have said.
+                        # near_miss_candidates entry, so it can't protect against a repeat ask
+                        # once the candidate is restored -- this separate, never-auto-cleared
+                        # store is what actually survives that cycle. Reuses the same
+                        # "genuinely higher peak" threshold as peak_changed above; a peak
+                        # that's still essentially the one Claude already declined is treated
+                        # as still-stale for free, mirroring exactly what a real repeat call
+                        # would have said.
                         remembered_stale_low = self.on_deck_stale_dip_low.get(ticker)
                         still_known_stale = (
                             remembered_stale_low is not None
-                            and not _dip_low_changed_meaningfully(
-                                remembered_stale_low, dip["low"], refresh_pct))
+                            and not _dip_peak_changed_meaningfully(
+                                remembered_stale_low, dip["peak"], refresh_pct))
                         if still_known_stale:
                             to_evict_stale.append(ticker)
                             continue
-                        if (nm.get("direction") == "up" and nm.get("streak", 0) >= 2
+                        if (nm.get("direction") == "down" and nm.get("streak", 0) >= 2
                                 and not nm.get("ai_entry_pending")
-                                and low_changed):
+                                and peak_changed):
                             nm["ai_entry_pending"] = True
                             asyncio.create_task(self._compute_ai_dip_entry(ticker))
-                        if low_changed or nm.get("ai_entry_price") is None:
-                            continue  # no current AI recommendation for this dip yet
-                        # Must genuinely rise UP THROUGH the entry, not merely already sit at
-                        # or above it (2026-07-28, DV incident) -- see _ai_entry_trigger's
-                        # docstring for the full incident writeup, including the 2026-08-04
-                        # arm_band_pct addition that widens "below" to "within this % above."
+                        if peak_changed or nm.get("ai_entry_price") is None:
+                            continue  # no current AI recommendation for this rally yet
+                        # Must genuinely fall DOWN THROUGH the entry, not merely already sit at
+                        # or below it (mirrors AITrading's 2026-07-28 DV incident) -- see
+                        # _short_ai_entry_trigger's docstring for the full incident writeup,
+                        # including the arm_band_pct addition that widens "above" to "within
+                        # this % below."
                         arm_band_pct = self.config["research"].get("on_deck_ai_entry_arm_band_pct", 2.0)
-                        should_promote, nm["ai_entry_seen_below"] = _ai_entry_trigger(
+                        should_promote, nm["ai_entry_seen_below"] = _short_ai_entry_trigger(
                             price, nm["ai_entry_price"], nm.get("ai_entry_seen_below", False), arm_band_pct)
                         if not should_promote:
                             continue  # hasn't genuinely reached the AI-recommended entry yet
                     else:
                         # Mechanical mode has no Claude call to judge staleness the way "ai"
-                        # mode now does (2026-07-28, RRC/OVV incident) -- a hardcoded recency
-                        # floor on the low itself is the only fix available here. See
-                        # _dip_low_too_stale's docstring.
+                        # mode now does (mirrors AITrading's 2026-07-28 RRC/OVV incident) -- a
+                        # hardcoded recency floor on the peak itself is the only fix available
+                        # here. See _dip_low_too_stale's docstring.
                         max_low_age_days = self.config["research"].get(
                             "on_deck_max_dip_low_age_days", 14.0)
-                        if _dip_low_too_stale(dip["low_t"], now_ts, max_low_age_days):
-                            continue  # low is too old to represent a genuine, current dip
-                        if price < dip["retracement_target"]:
-                            continue  # hasn't retraced enough of the dip yet
+                        if _dip_low_too_stale(dip["peak_t"], now_ts, max_low_age_days):
+                            continue  # peak is too old to represent a genuine, current rally
+                        if price > dip["retracement_target"]:
+                            continue  # hasn't rolled over enough from the rally yet
 
-                    to_promote.append((ticker, dip["low"]))
+                    to_promote.append((ticker, dip["peak"]))
 
                 for ticker, dip_low in to_promote:
                     nm_snapshot = self.near_miss_candidates.pop(ticker, None)
@@ -5042,13 +5130,14 @@ class DashboardState:
                 logger.error("near_miss_monitor_loop error: %s", e)
 
     async def _compute_ai_dip_entry(self, ticker: str) -> None:
-        """Fires once near_miss_monitor_loop sees a real dip that's started recovering (2+
-        consecutive upticks off the low) when research.on_deck_entry_mode == "ai" — gives
-        Claude the actual observed peak/low/current price and asks for a recommended entry,
-        rather than asking it to predict a pullback level before any dip has happened (it
-        can't meaningfully do that with no real price action to reason about yet — see the
-        2026-07-18 discussion in CLAUDE.md). Runs as a background task, not awaited by the
-        monitor loop itself, so one in-flight Claude call never blocks that loop's 60s tick
+        """Fires once near_miss_monitor_loop sees a real rally that's started rolling over
+        (2+ consecutive downticks off the peak) when research.on_deck_entry_mode == "ai" —
+        gives Claude the actual observed peak/low/current price and asks for a recommended
+        short entry, rather than asking it to predict a rollover level before any rally has
+        happened (it can't meaningfully do that with no real price action to reason about
+        yet — mirrors AITrading's own 2026-07-18 discussion in CLAUDE.md). Runs as a
+        background task, not awaited by the monitor loop itself, so one in-flight Claude
+        call never blocks that loop's 60s tick
         for every other candidate."""
         nm = self.near_miss_candidates.get(ticker)
         if nm is None:
@@ -5091,56 +5180,54 @@ class DashboardState:
                 return
             if result is None:
                 entry = self.add_ai_log(ticker, "ON_DECK",
-                    "AI dip-entry recommendation unavailable — will retry on next confirmed uptick",
+                    "AI short-entry recommendation unavailable — will retry on next confirmed downtick",
                     "warning")
                 await self.broadcast({"type": "ai_log", "entry": entry})
                 return
             entry_price, reasoning, stale = result
             if entry_price is None:
-                # Claude explicitly declined -- a real, reasoned "no" (stale low, not a
-                # genuine current uptrend), not a failure. Record ai_entry_low_ref anyway so
-                # _dip_low_changed_meaningfully doesn't treat the still-missing ai_entry_price
-                # as "no recommendation exists yet" and immediately re-fire a fresh (billed)
-                # call on the very next tick for the exact same low -- same wasteful-refire
-                # class of bug already fixed once for this feature (see that function's
-                # ALLY docstring). ai_entry_price deliberately stays unset, which keeps the
+                # Claude explicitly declined -- a real, reasoned "no" (stale peak, not a
+                # genuine current breakdown), not a failure. Record ai_entry_low_ref anyway
+                # so _dip_peak_changed_meaningfully doesn't treat the still-missing
+                # ai_entry_price as "no recommendation exists yet" and immediately re-fire a
+                # fresh (billed) call on the very next tick for the exact same peak -- same
+                # wasteful-refire class of bug AITrading's own dip-entry feature had before
+                # its fix. ai_entry_price deliberately stays unset, which keeps the
                 # promotion trigger's own "no current AI recommendation" check blocking a
-                # buy on this dip, same as an outright failure would.
-                nm["ai_entry_low_ref"] = dip["low"]
+                # short on this rally, same as an outright failure would.
+                nm["ai_entry_low_ref"] = dip["peak"]
                 entry = self.add_ai_log(ticker, "ON_DECK",
                     f"AI declined this entry — {reasoning}", "warning")
                 await self.broadcast({"type": "ai_log", "entry": entry})
                 if stale:
-                    # Genuinely stale reference point (2026-07-30, user request: a
-                    # candidate AI keeps declining on the same old, never-going-to-be-
-                    # fresh-again low was supposed to give way to a fresh candidate, not
-                    # sit on On Deck taking up a slot indefinitely -- confirmed live for
-                    # OKE/OVV, both declining daily on a ~29-day-old already-recovered
-                    # low with no automatic consequence). This is Claude's own judgment
-                    # (recommend_dip_entry's "stale" field), not a hardcoded proxy --
-                    # consistent with this project's standing preference for trusting
-                    # real AI judgment over mechanical rules (see CLAUDE.md). Reuses the
-                    # exact same manual ✕-button mechanism (remove_on_deck_candidate) --
-                    # same free price-based auto-restore if price genuinely breaks out
-                    # later, same persisted note -- just triggered automatically instead
-                    # of requiring the user to notice and click it themselves. A decline
-                    # that's merely "too early" (stale=False) is deliberately left alone;
-                    # that candidate is still legitimately developing and this whole
-                    # monitoring loop exists to keep watching it.
-                    # Persist the declined low separately from the block itself
-                    # (2026-07-31, BRO repeat-decline incident) -- the removal below
-                    # deletes this candidate's whole near_miss_candidates entry,
-                    # including ai_entry_low_ref just set above, so THAT guard can't
-                    # survive to protect against a repeat ask once this ticker is
-                    # restored. See _save_on_deck_stale_dip_low's docstring.
-                    self.on_deck_stale_dip_low[ticker] = dip["low"]
+                    # Genuinely stale reference point (mirrors AITrading's 2026-07-30 user
+                    # request: a candidate AI keeps declining on the same old,
+                    # never-going-to-be-fresh-again peak was supposed to give way to a fresh
+                    # candidate, not sit on On Deck taking up a slot indefinitely). This is
+                    # Claude's own judgment (recommend_dip_entry's "stale" field), not a
+                    # hardcoded proxy -- consistent with this project's standing preference
+                    # for trusting real AI judgment over mechanical rules (see CLAUDE.md).
+                    # Reuses the exact same manual ✕-button mechanism
+                    # (remove_on_deck_candidate) -- same free price-based auto-restore if
+                    # price genuinely breaks out later, same persisted note -- just
+                    # triggered automatically instead of requiring the user to notice and
+                    # click it themselves. A decline that's merely "too early" (stale=False)
+                    # is deliberately left alone; that candidate is still legitimately
+                    # developing and this whole monitoring loop exists to keep watching it.
+                    # Persist the declined peak separately from the block itself (mirrors
+                    # AITrading's 2026-07-31 BRO repeat-decline incident) -- the removal
+                    # below deletes this candidate's whole near_miss_candidates entry,
+                    # including ai_entry_low_ref just set above, so THAT guard can't survive
+                    # to protect against a repeat ask once this ticker is restored. See
+                    # _save_on_deck_stale_dip_low's docstring.
+                    self.on_deck_stale_dip_low[ticker] = dip["peak"]
                     asyncio.create_task(asyncio.to_thread(
                         _save_on_deck_stale_dip_low, dict(self.on_deck_stale_dip_low)))
                     block_days = self.config["research"].get(
                         "on_deck_ai_stale_decline_block_days", 1)
                     await self.remove_on_deck_candidate(
                         ticker, permanent=False, days=block_days,
-                        note=f"AI auto-removed (stale dip): {reasoning}",
+                        note=f"AI auto-removed (stale rally): {reasoning}",
                         initiated_by="ai",
                     )
                     return
@@ -5148,27 +5235,28 @@ class DashboardState:
                     asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
                 return
             nm["ai_entry_price"] = entry_price
-            nm["ai_entry_low_ref"] = dip["low"]
+            nm["ai_entry_low_ref"] = dip["peak"]
             nm["ai_entry_reasoning"] = reasoning
             # A fresh, valid (non-stale) recommendation supersedes any earlier stale
             # verdict remembered for this ticker (2026-07-31) -- the situation has
-            # genuinely moved past whatever old low that memory was protecting against.
+            # genuinely moved past whatever old peak that memory was protecting against.
             if self.on_deck_stale_dip_low.pop(ticker, None) is not None:
                 asyncio.create_task(asyncio.to_thread(
                     _save_on_deck_stale_dip_low, dict(self.on_deck_stale_dip_low)))
-            # Whether the promotion trigger already starts "armed" (2026-07-28, DV incident)
-            # -- Claude is asked for a good entry PRICE, not necessarily one above the
-            # current price; it commonly recommends a support level BELOW where price has
-            # already recovered to (DV: recommended $10.65 with price already at $11.27).
-            # The trigger below requires a genuine rise up through ai_entry_price, so if
-            # current price is already at/above the recommendation, that hasn't happened yet
-            # -- starts unarmed, requiring a real pullback back below entry first. Only
-            # starts pre-armed when price is already below the recommendation, matching the
-            # ordinary "waiting for it to rise" case this feature was originally designed for.
-            # arm_band_pct (2026-08-04) widens "below" to "within this % above" -- see
-            # _ai_entry_initially_armed/_ai_entry_trigger's docstrings for the full reasoning.
+            # Whether the promotion trigger already starts "armed" (mirrors AITrading's
+            # 2026-07-28 DV incident) -- Claude is asked for a good SHORT entry PRICE, not
+            # necessarily one below the current price; it commonly recommends a resistance
+            # level ABOVE where price has already rolled over to. The trigger below
+            # requires a genuine fall down through ai_entry_price, so if current price is
+            # already at/below the recommendation, that hasn't happened yet -- starts
+            # unarmed, requiring a real bounce back above entry first. Only starts pre-armed
+            # when price is already above the recommendation, matching the ordinary
+            # "waiting for it to fall" case this feature is designed for. arm_band_pct
+            # widens "above" to "within this % below" -- see
+            # _short_ai_entry_initially_armed/_short_ai_entry_trigger's docstrings for the
+            # full reasoning.
             arm_band_pct = self.config["research"].get("on_deck_ai_entry_arm_band_pct", 2.0)
-            nm["ai_entry_seen_below"] = _ai_entry_initially_armed(
+            nm["ai_entry_seen_below"] = _short_ai_entry_initially_armed(
                 nm.get("last_price", 0.0), entry_price, arm_band_pct)
             entry = self.add_ai_log(ticker, "ON_DECK",
                 f"AI recommended entry ${entry_price:.2f} — {reasoning}", "neutral")
@@ -5192,7 +5280,7 @@ class DashboardState:
         entry = {
             "ticker": ticker,
             "timestamp": self._now_et().isoformat(),
-            "trigger": "Dip Recovery" if dip_low is not None else "No-Dip Uptrend",
+            "trigger": "Rally Rollover" if dip_low is not None else "No-Rally Downtrend",
             "outcome": outcome,
             "conviction": conviction,
             "rr": round(rr, 2) if rr is not None else None,
@@ -5208,7 +5296,7 @@ class DashboardState:
     async def _attempt_near_miss_promotion(
         self, ticker: str, nm_snapshot: dict | None = None, dip_low: float | None = None,
     ):
-        """Fired when a candidate clears R/R + a confirmed uptick. Runs one fresh Claude
+        """Fired when a candidate clears R/R + a confirmed downtick. Runs one fresh Claude
         re-analysis (pre-open data can be hours old) and, if it still passes every normal buy
         gate, executes the buy immediately — the confirmation moment itself is the entry
         signal; waiting for anything else would let it go stale before being acted on. This is
@@ -5226,7 +5314,7 @@ class DashboardState:
         governs whether a genuinely weak stock eventually leaves the list, via the next
         persist-check.
 
-        `dip_low` — the peak-to-low dip's low price that triggered THIS attempt, or None if
+        `dip_low` — the low-to-peak rally's peak price that triggered THIS attempt, or None if
         this attempt came from the no-dip sustained-uptrend trigger instead (2026-07-21 — see
         near_miss_monitor_loop). On failure, a real dip_low is stored as
         nm["promotion_failed_low"] so near_miss_monitor_loop won't re-trigger another attempt
@@ -5340,7 +5428,7 @@ class DashboardState:
                 return
 
             entry = self.add_ai_log(ticker, "ON_DECK",
-                "R/R recovered + confirmed uptick — running fresh analysis...", "info")
+                "R/R recovered + confirmed downtick — running fresh analysis...", "info")
             await self.broadcast({"type": "ai_log", "entry": entry})
 
             try:
@@ -5562,7 +5650,7 @@ class DashboardState:
                 position_size_pct=(report.position_size_pct
                                     or self.config["risk_management"].get("starting_position_pct", 3.0)),
                 position_size_dollars=position_size, shares=shares,
-                reasoning=f"On Deck Deploy — R/R recovered to {rr:.2f} with confirmed uptick",
+                reasoning=f"On Deck Deploy — R/R recovered to {rr:.2f} with confirmed downtick",
                 research_report=None, generated_at=datetime.now(), should_execute=True,
                 sector=getattr(report, "sector", ""),
             )
@@ -5604,7 +5692,7 @@ class DashboardState:
                 await self.broadcast({"type": "ai_log", "entry": entry})
                 asyncio.create_task(_notify(
                     f"BUY {ticker} (On Deck Deploy)",
-                    f"{shares:.4g} shares @ ${_fp:.2f} | R/R recovered to {rr:.2f} after confirmed uptick",
+                    f"{shares:.4g} shares @ ${_fp:.2f} | R/R recovered to {rr:.2f} after confirmed downtick",
                     priority="high", tags="white_check_mark"))
                 logger.info("On Deck Deploy buy %s — %.4g shares @ $%.2f (R/R %.2f)",
                             ticker, shares, _fp, rr)
@@ -7082,7 +7170,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         persistent watchlist, but there is no more persistent watchlist to re-vet: buying no
         longer depends on a cached, twice-daily-scanned list, since near_miss_monitor_loop
         watches every qualifying stock continuously and _attempt_near_miss_promotion buys the
-        instant a candidate clears R/R + a confirmed uptick (with rotation-swap if the
+        instant a candidate clears R/R + a confirmed downtick (with rotation-swap if the
         portfolio is full). There is also no more slot-based cap on how many candidates get
         tracked — every qualifying stock is watched, sorted by R/R on the dashboard so
         already-attractive stocks sit at the top. All Claude spend is here so daytime scans
@@ -7974,6 +8062,21 @@ def _recent_window_high(price_history: list[tuple[float, float]]) -> float | Non
     return max(p[1] for p in price_history)
 
 
+def _recent_window_low(price_history: list[tuple[float, float]]) -> float | None:
+    """Short-side mirror of _recent_window_high (2026-08-19): the lowest close anywhere
+    in a windowed price-history slice -- the reference low a manually-removed On Deck
+    ticker must break below before _check_price_based_unblocks restores its eligibility.
+    Same rationale as the long-only original, mirrored: dip_summary's "low" field is
+    measured strictly BEFORE the tracked peak, which for a STALE peak can sit right at
+    the edge of the history window, leaving almost no real data before it -- an
+    unreliable reference for "has this stock made a genuinely new low recently." Taking
+    the min close over the whole window instead answers that question directly,
+    regardless of where any rally's peak sits."""
+    if not price_history:
+        return None
+    return min(p[1] for p in price_history)
+
+
 @app.get("/api/near-miss")
 async def get_near_miss():
     """Near-miss candidates — BUY-signal, conviction-qualified stocks rejected at pre-open
@@ -8022,7 +8125,7 @@ async def get_near_miss():
         dip_target_rr = rr_at_price(dip["retracement_target"], fair_value, stop_loss_pct) if dip else None
         ai_entry_target_rr = None
         if (dip is not None and nm.get("ai_entry_price") is not None
-                and nm.get("ai_entry_low_ref") == dip["low"]):
+                and nm.get("ai_entry_low_ref") == dip["peak"]):
             ai_entry_target_rr = rr_at_price(nm["ai_entry_price"], fair_value, stop_loss_pct)
         # required_rr (2026-07-18): this candidate's own conviction-scaled threshold, falling
         # back to computing it fresh for any candidate created before the field existed.
@@ -8213,7 +8316,7 @@ async def get_near_miss_history(ticker: str):
     dip_target_rr = rr_at_price(dip["retracement_target"], fair_value, stop_loss_pct) if dip else None
     ai_entry_target_rr = None
     if (dip is not None and nm.get("ai_entry_price") is not None
-            and nm.get("ai_entry_low_ref") == dip["low"]):
+            and nm.get("ai_entry_low_ref") == dip["peak"]):
         ai_entry_target_rr = rr_at_price(nm["ai_entry_price"], fair_value, stop_loss_pct)
     return {
         "ticker": ticker, "fair_value_estimate": fair_value, "min_rr": min_rr, "points": points,

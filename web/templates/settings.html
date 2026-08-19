@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="/static/icon-192.png" type="image/png">
 <title>Doug's AIShortTrading — Settings</title>
 <script>
 // Per-device theme (2026-07-28) -- see dashboard.html's identical inline script for the
@@ -690,19 +691,19 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">On Deck Entry Mode <button type="button" class="info-btn" onclick="showInfo(event,'How On Deck decides a dip has recovered enough to buy. AI mode: once a real dip starts recovering (2+ consecutive upticks off the low), asks Claude once for a specific entry price given the actual observed peak/low/current price -- a judgment call informed by real price action, not a prediction made before any dip happened. Retracement % mode: a fixed mechanical rule instead -- price must recover a set percentage of the dip depth (see the setting below). Both modes share the same underlying peak/low/depth detection; only how the final entry price is decided differs. The other mode\'s number is still shown on the chart for comparison even while inactive.')">i</button></div>
-          <div class="setting-desc">How the entry price for a recovering dip gets decided</div>
+          <div class="setting-label">On Deck Entry Mode <button type="button" class="info-btn" onclick="showInfo(event,'How On Deck decides a rally has rolled over enough to short. AI mode: once a real rally starts rolling over (2+ consecutive downticks off the peak), asks Claude once for a specific short entry price given the actual observed peak/low/current price -- a judgment call informed by real price action, not a prediction made before any rally happened. Retracement % mode: a fixed mechanical rule instead -- price must roll over a set percentage of the rally depth (see the setting below). Both modes share the same underlying low/peak/depth detection; only how the final entry price is decided differs. The other mode\'s number is still shown on the chart for comparison even while inactive.')">i</button></div>
+          <div class="setting-desc">How the short entry price for a rolling-over rally gets decided</div>
         </div>
         <select class="setting-input" name="research.on_deck_entry_mode">
-          <option value="ai" {% if cfg.research.on_deck_entry_mode == 'ai' %}selected{% endif %}>AI-recommended (Claude judges each real dip)</option>
+          <option value="ai" {% if cfg.research.on_deck_entry_mode == 'ai' %}selected{% endif %}>AI-recommended (Claude judges each real rally)</option>
           <option value="retracement" {% if cfg.research.on_deck_entry_mode == 'retracement' %}selected{% endif %}>Fixed % retracement (mechanical rule)</option>
         </select>
         <div class="default-label">default<br><span class="default-val">AI</span></div>
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">AI Dip-Entry Refresh % <button type="button" class="info-btn" onclick="showInfo(event,'AI mode fires a real Claude call to get a fresh recommended entry price the first time a dip shows 2+ consecutive upticks off its low. If the tracked low keeps drifting afterward by ordinary noise (a few cents as the observation window slides), this stops that from burning another real Claude call for essentially the same answer -- a new call only fires once the low has dropped at least this many percent further than the low the last recommendation was based on. A genuinely deeper dip still always gets a fresh look; only trivial sub-threshold drift is skipped. Only used in AI Entry Mode.')">i</button></div>
-          <div class="setting-desc">Min. % the dip low must drop further before asking Claude again for a fresh entry price (AI mode only)</div>
+          <div class="setting-label">AI Short-Entry Refresh % <button type="button" class="info-btn" onclick="showInfo(event,'AI mode fires a real Claude call to get a fresh recommended short entry price the first time a rally shows 2+ consecutive downticks off its peak. If the tracked peak keeps drifting afterward by ordinary noise (a few cents as the observation window slides), this stops that from burning another real Claude call for essentially the same answer -- a new call only fires once the peak has risen at least this many percent further than the peak the last recommendation was based on. A genuinely higher peak still always gets a fresh look; only trivial sub-threshold drift is skipped. Only used in AI Entry Mode.')">i</button></div>
+          <div class="setting-desc">Min. % the rally peak must rise further before asking Claude again for a fresh entry price (AI mode only)</div>
         </div>
         <input type="number" step="0.1" class="setting-input" name="research.on_deck_ai_entry_low_refresh_pct"
                value="{{ cfg.research.on_deck_ai_entry_low_refresh_pct }}" min="0.1" max="20">
@@ -737,8 +738,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">Max Dip Low Age (days) <button type="button" class="info-btn" onclick="showInfo(event,'How old a tracked dip low is allowed to be before it is treated as stale (no usable dip at all), rather than a genuine current setup. Without this, a mechanical peak/low search has no recency requirement -- it finds the single lowest point anywhere in the whole lookback window regardless of how old it is, so a low from weeks ago on a stock that has simply been trending the whole time can still pass a mechanical \'price is above the old low\' check. Covers both the dip-recovery trigger and the No-Dip Uptrend trigger below (its window-low reference has the identical flaw). Set to 0 to disable this recency check entirely.')">i</button></div>
-          <div class="setting-desc">A dip low older than this many days is treated as stale, not a real current dip</div>
+          <div class="setting-label">Max Rally Peak Age (days) <button type="button" class="info-btn" onclick="showInfo(event,'How old a tracked rally peak is allowed to be before it is treated as stale (no usable rally at all), rather than a genuine current setup. Without this, a mechanical low/peak search has no recency requirement -- it finds the single highest point anywhere in the whole lookback window regardless of how old it is, so a peak from weeks ago on a stock that has simply been trending the whole time can still pass a mechanical \'price is below the old peak\' check. Covers both the rally-rollover trigger and the No-Rally Downtrend trigger below (its window-high reference has the identical flaw). Set to 0 to disable this recency check entirely.')">i</button></div>
+          <div class="setting-desc">A rally peak older than this many days is treated as stale, not a real current rally</div>
         </div>
         <input type="number" step="1" class="setting-input" name="research.on_deck_max_dip_low_age_days"
                value="{{ cfg.research.on_deck_max_dip_low_age_days }}" min="0" max="90">
@@ -746,8 +747,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">No-Dip Uptrend % Gain <button type="button" class="info-btn" onclick="showInfo(event,'A candidate that has never shown a real peak-to-low dip in its history window (it has simply been climbing steadily) cannot trigger a buy through the normal dip-recovery trigger above, since there is no dip to confirm a recovery from -- even if conviction and R/R already clear their gates. This is a second, independent trigger: once price has risen this many percent above the lowest price in the history window, it is treated as a confirmed sustained uptrend and a buy is attempted directly (still subject to a completely fresh re-check of every gate at the moment of the attempt). Measured as a percentage gain rather than a run of consecutive upticks, so one brief down tick in an otherwise real uptrend does not erase all prior progress the way a streak counter would.')">i</button></div>
-          <div class="setting-desc">% price must have risen above its window low to buy a candidate that never showed a real dip</div>
+          <div class="setting-label">No-Rally Downtrend % Loss <button type="button" class="info-btn" onclick="showInfo(event,'A candidate that has never shown a real low-to-peak rally in its history window (it has simply been declining steadily) cannot trigger a short through the normal rally-rollover trigger above, since there is no rally to confirm a rollover from -- even if conviction and R/R already clear their gates. This is a second, independent trigger: once price has fallen this many percent below the highest price in the history window, it is treated as a confirmed sustained downtrend and a short is attempted directly (still subject to a completely fresh re-check of every gate at the moment of the attempt). Measured as a percentage loss rather than a run of consecutive downticks, so one brief up tick in an otherwise real downtrend does not erase all prior progress the way a streak counter would.')">i</button></div>
+          <div class="setting-desc">% price must have fallen below its window high to short a candidate that never showed a real rally</div>
         </div>
         <input type="number" step="0.5" class="setting-input" name="research.on_deck_no_dip_pct_gain"
                value="{{ cfg.research.on_deck_no_dip_pct_gain }}" min="1" max="100">
@@ -755,8 +756,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">No-Dip Up-Ticks Needed <button type="button" class="info-btn" onclick="showInfo(event,'A second, independent trigger alongside No-Dip Uptrend % Gain above, for a candidate that has never shown a real peak-to-low dip. Looks at the last N price changes (N set by the window below) and fires a buy attempt once at least this many of them were upticks -- e.g. 7 out of a window of 10 means 7 of the last 10 price changes moved up. Catches a steady, low-volatility grind upward that may never rack up a large percentage price gain, using the two triggers together rather than either alone.')">i</button></div>
-          <div class="setting-desc">How many of the last N price changes (window below) must be upticks</div>
+          <div class="setting-label">No-Rally Down-Ticks Needed <button type="button" class="info-btn" onclick="showInfo(event,'A second, independent trigger alongside No-Rally Downtrend % Loss above, for a candidate that has never shown a real low-to-peak rally. Looks at the last N price changes (N set by the window below) and fires a short attempt once at least this many of them were downticks -- e.g. 7 out of a window of 10 means 7 of the last 10 price changes moved down. Catches a steady, low-volatility grind downward that may never rack up a large percentage price decline, using the two triggers together rather than either alone.')">i</button></div>
+          <div class="setting-desc">How many of the last N price changes (window below) must be downticks</div>
         </div>
         <input type="number" step="1" class="setting-input" name="research.on_deck_up_ticks_needed"
                value="{{ cfg.research.on_deck_up_ticks_needed }}" min="1" max="50">
@@ -764,8 +765,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">No-Dip Up-Tick Window <button type="button" class="info-btn" onclick="showInfo(event,'How many of the most recent price changes to look at for the No-Dip Up-Ticks Needed trigger above -- e.g. 10 means the last 10 tick-to-tick moves. A candidate needs at least this many recorded changes before the trigger can fire at all.')">i</button></div>
-          <div class="setting-desc">How many recent price changes the up-tick trigger looks at</div>
+          <div class="setting-label">No-Rally Down-Tick Window <button type="button" class="info-btn" onclick="showInfo(event,'How many of the most recent price changes to look at for the No-Rally Down-Ticks Needed trigger above -- e.g. 10 means the last 10 tick-to-tick moves. A candidate needs at least this many recorded changes before the trigger can fire at all.')">i</button></div>
+          <div class="setting-desc">How many recent price changes the down-tick trigger looks at</div>
         </div>
         <input type="number" step="1" class="setting-input" name="research.on_deck_up_ratio_window"
                value="{{ cfg.research.on_deck_up_ratio_window }}" min="3" max="50">

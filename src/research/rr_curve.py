@@ -7,38 +7,47 @@ so it's directly unit-testable without importing the web app module.
 
 
 def dip_summary(price_history: list[tuple[float, float]], retracement_pct: float) -> dict | None:
-    """Peak-to-low dip depth and the retracement price target — the exact same
-    previous-peak/low/depth math near_miss_monitor_loop uses to decide the buy trigger,
-    extracted here (2026-07-18) so a card-level "here's what's happening" summary can show
-    the identical numbers instead of a second, easily-drifting copy of the calculation.
+    """Low-to-peak rally depth and the rollover price target — the exact same
+    previous-low/peak/depth math near_miss_monitor_loop uses to decide the short-entry
+    trigger, extracted here (2026-07-18) so a card-level "here's what's happening" summary
+    can show the identical numbers instead of a second, easily-drifting copy of the
+    calculation.
 
-    low_ts/low_price is the FIRST (earliest) occurrence of price_history's minimum price —
-    the actual bottom of the dip, not a later repeat of the same low if one exists. "Previous
-    peak" is the highest price strictly BEFORE that timestamp, deliberately excluding any
-    price after the low (a post-low spike isn't part of the dip being measured). peak_t is
-    that peak's own timestamp (2026-07-28, RRC/OVV incident) -- added so a caller can tell
-    Claude how many days ago the peak/low actually happened, not just their bare prices; see
-    recommend_dip_entry's docstring for why that mattered (a low sitting near the edge of a
-    long trending window still passes the "there's a peak before the low" check below even
-    when it's weeks old and no longer represents a real, current dip).
+    Short economics (2026-08-19): this system watches for a RALLY that then ROLLS OVER,
+    not a dip that recovers -- the mirror image of AITrading's own dip-recovery trigger
+    (see docs/superpowers/specs/2026-08-19-aishorttrading-design.md). peak/peak_t and
+    low/low_t keep their literal meanings unchanged (peak = the highest price found, low =
+    the lowest price found) -- only which one is searched for FIRST, and which one the
+    retracement target is anchored to, flips.
 
-    Returns None if there's no measurable dip yet (empty history, the low is the oldest point
-    in the window with nothing before it to compare against, or the "peak" turns out to be at
-    or below the low) — same "not enough data, don't guess" case the buy-trigger check itself
-    treats as unable to promote, so a caller can render "not enough history yet" instead of a
-    misleading number.
+    peak_ts/peak is the FIRST (earliest) occurrence of price_history's maximum price — the
+    actual top of the rally, not a later repeat of the same high if one exists. "Prior low"
+    is the lowest price strictly BEFORE that timestamp, deliberately excluding any price
+    after the peak (a post-peak dip isn't part of the rally being measured). low_t is that
+    low's own timestamp (mirrors AITrading's 2026-07-28 RRC/OVV peak_t addition) -- added so
+    a caller can tell Claude how many days ago the peak/low actually happened, not just
+    their bare prices; see recommend_dip_entry's docstring for why that matters (a peak
+    sitting near the edge of a long trending window still passes the "there's a low before
+    the peak" check below even when it's weeks old and no longer represents a real, current
+    rally).
+
+    Returns None if there's no measurable rally yet (empty history, the peak is the oldest
+    point in the window with nothing before it to compare against, or the "low" turns out to
+    be at or above the peak) — same "not enough data, don't guess" case the short-entry
+    trigger check itself treats as unable to promote, so a caller can render "not enough
+    history yet" instead of a misleading number.
     """
     if not price_history:
         return None
-    low_ts, low_price = min(price_history, key=lambda p: p[1])
-    prior_points = [(ts, p) for ts, p in price_history if ts < low_ts]
-    if not prior_points or low_price <= 0:
+    peak_ts, peak = max(price_history, key=lambda p: p[1])
+    prior_points = [(ts, p) for ts, p in price_history if ts < peak_ts]
+    if not prior_points or peak <= 0:
         return None
-    peak_ts, peak = max(prior_points, key=lambda point: point[1])
+    low_ts, low_price = min(prior_points, key=lambda point: point[1])
     depth = peak - low_price
     if depth <= 0:
         return None
-    target = low_price + depth * (retracement_pct / 100)
+    target = peak - depth * (retracement_pct / 100)
     return {
         "peak": round(peak, 2),
         "peak_t": peak_ts,

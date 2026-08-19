@@ -9,6 +9,7 @@
 <meta name="apple-mobile-web-app-title" content="Doug's AIShortTrading">
 <link rel="manifest" href="/static/manifest.json">
 <link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="icon" href="/static/icon-192.png" type="image/png">
 <title>Doug's AIShortTrading — Live Dashboard</title>
 <script>
 // Per-device theme (2026-07-28, user request) -- runs synchronously before <style> is
@@ -1123,8 +1124,8 @@ tbody tr:hover { background: var(--bg-card-hover); }
   <div class="trade-modal" style="max-width:340px;text-align:center;">
     <h3 style="margin-bottom:8px;">Remove <span id="odrTicker"></span> from On Deck?</h3>
     <p style="color:var(--text-muted);font-size:13px;margin-bottom:14px;">
-      Blocked until you unblock it — or automatically, for free, once price breaks out
-      above its recent high.
+      Blocked until you unblock it — or automatically, for free, once price breaks down
+      below its recent low.
     </p>
     <div style="display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:12px;">
       <input type="number" id="odrDays" value="1" min="1" max="365" style="width:60px;text-align:center;background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border);border-radius:4px;padding:6px;">
@@ -2963,18 +2964,20 @@ function renderCardCandleLWC(container, points) {
   return chart;
 }
 
-// Plain-English "here's what's happening" line for the dip-entry mechanism (2026-07-18).
-// Always shows the underlying peak/low/depth (dip_summary) regardless of entry mode, plus
-// whichever mode is active AND the other mode's number for comparison — per explicit
-// request, so a user running "ai" mode can still see how far Claude's judgment diverges
-// from the flat 20% retracement figure over time.
+// Plain-English "here's what's happening" line for the short-entry mechanism (2026-07-18;
+// short economics 2026-08-19 -- this system watches a rally that rolls over, not a dip
+// that recovers). Always shows the underlying low/peak/depth (dip_summary) regardless of
+// entry mode, plus whichever mode is active AND the other mode's number for comparison —
+// per explicit request, so a user running "ai" mode can still see how far Claude's
+// judgment diverges from the flat 20% retracement figure over time.
 function dipEntrySummary(nm) {
   const dip = nm.dip;
-  if (!dip) return 'Not enough history yet to measure a dip.';
-  const base = `Dipped ${dip.depth_pct}% ($${dip.depth.toFixed(2)}): $${dip.peak.toFixed(2)} → $${dip.low.toFixed(2)}`;
+  if (!dip) return 'Not enough history yet to measure a rally.';
+  const base = `Rallied ${dip.depth_pct}% ($${dip.depth.toFixed(2)}): $${dip.low.toFixed(2)} → $${dip.peak.toFixed(2)}`;
   const price = nm.last_price || 0;
+  // Short: "to go" means how much further price must FALL to reach the target.
   const toGoStr = target => {
-    const toGo = target - price;
+    const toGo = price - target;
     return toGo <= 0 ? '<span class="positive">cleared</span>' : `$${toGo.toFixed(2)} to go`;
   };
   const retraceStr = `20% retrace $${dip.retracement_target.toFixed(2)} (${toGoStr(dip.retracement_target)})`;
@@ -2982,14 +2985,14 @@ function dipEntrySummary(nm) {
     return `${base} · Entry near $${dip.retracement_target.toFixed(2)} (${toGoStr(dip.retracement_target)})`;
   }
   // ai mode
-  const aiReady = nm.ai_entry_price != null && nm.ai_entry_low_ref === dip.low;
+  const aiReady = nm.ai_entry_price != null && nm.ai_entry_low_ref === dip.peak;
   if (aiReady) {
     return `${base} · AI entry $${nm.ai_entry_price.toFixed(2)} (${toGoStr(nm.ai_entry_price)}) — vs ${retraceStr}`;
   }
   const streak = Math.min(nm.streak || 0, 2);
-  const waiting = nm.direction === 'up'
-    ? `watching recovery (${streak}/2 upticks before asking AI for an entry)`
-    : 'waiting for a confirmed uptick off the low';
+  const waiting = nm.direction === 'down'
+    ? `watching rollover (${streak}/2 downticks before asking AI for an entry)`
+    : 'waiting for a confirmed downtick off the peak';
   return `${base} · ${waiting}`;
 }
 
@@ -3003,38 +3006,38 @@ function dipEntryParagraph(nm) {
   const dip = nm.dip;
   const ticker = nm.ticker || '';
   if (!dip) {
-    return `${ticker} doesn't have enough price history yet to measure a peak-to-low dip — check back after a few more monitoring cycles.`;
+    return `${ticker} doesn't have enough price history yet to measure a low-to-peak rally — check back after a few more monitoring cycles.`;
   }
   const price = nm.last_price || 0;
   const sentences = [];
   sentences.push(
-    `${ticker} has pulled back ${dip.depth_pct}% ($${dip.depth.toFixed(2)}) from a recent peak of ` +
-    `$${dip.peak.toFixed(2)}, bottoming near $${dip.low.toFixed(2)} before starting to recover. ` +
+    `${ticker} has rallied ${dip.depth_pct}% ($${dip.depth.toFixed(2)}) from a recent low of ` +
+    `$${dip.low.toFixed(2)}, topping near $${dip.peak.toFixed(2)} before starting to roll over. ` +
     `It's currently trading at $${price.toFixed(2)}.`
   );
   const retraceTarget = dip.retracement_target;
-  const retraceCleared = price >= retraceTarget;
+  const retraceCleared = price <= retraceTarget;
   const retraceSentence = `The mechanical 20% retracement rule sets an entry at $${retraceTarget.toFixed(2)}` +
-    (retraceCleared ? ', which price has already cleared.' : ` — $${(retraceTarget - price).toFixed(2)} more to go before it triggers.`);
+    (retraceCleared ? ', which price has already cleared.' : ` — $${(price - retraceTarget).toFixed(2)} more to go before it triggers.`);
 
   if (nm.entry_mode !== 'ai') {
     sentences.push(retraceSentence);
     return sentences.join(' ');
   }
-  const aiReady = nm.ai_entry_price != null && nm.ai_entry_low_ref === dip.low;
+  const aiReady = nm.ai_entry_price != null && nm.ai_entry_low_ref === dip.peak;
   if (aiReady) {
-    const aiCleared = price >= nm.ai_entry_price;
+    const aiCleared = price <= nm.ai_entry_price;
     sentences.push(
-      `Once the recovery was confirmed, Claude recommended a specific entry price of ` +
+      `Once the rollover was confirmed, Claude recommended a specific entry price of ` +
       `$${nm.ai_entry_price.toFixed(2)}${nm.ai_entry_reasoning ? ` — "${nm.ai_entry_reasoning}"` : ''} ` +
-      (aiCleared ? 'Price has already cleared that level.' : `Price still needs to reach it ($${(nm.ai_entry_price - price).toFixed(2)} to go).`)
+      (aiCleared ? 'Price has already cleared that level.' : `Price still needs to reach it ($${(price - nm.ai_entry_price).toFixed(2)} to go).`)
     );
     sentences.push(`For comparison, ${retraceSentence.charAt(0).toLowerCase() + retraceSentence.slice(1)}`);
   } else {
     const streak = Math.min(nm.streak || 0, 2);
-    sentences.push(nm.direction === 'up'
-      ? `The recovery isn't confirmed yet (${streak} of 2 consecutive upticks off the low) — once it is, Claude will be asked for a specific entry price based on the real observed peak, low, and current price, rather than a guess made before any dip happened.`
-      : `The stock hasn't shown a confirmed uptick off the low yet, so no AI entry recommendation has been requested.`);
+    sentences.push(nm.direction === 'down'
+      ? `The rollover isn't confirmed yet (${streak} of 2 consecutive downticks off the peak) — once it is, Claude will be asked for a specific entry price based on the real observed peak, low, and current price, rather than a guess made before any rally happened.`
+      : `The stock hasn't shown a confirmed downtick off the peak yet, so no AI entry recommendation has been requested.`);
     sentences.push(`For reference, ${retraceSentence.charAt(0).toLowerCase() + retraceSentence.slice(1)}`);
   }
   return sentences.join(' ');
@@ -3245,8 +3248,8 @@ function renderNearMissGrid(data) {
   if (items.length === 0) {
     document.getElementById('stockGrid').innerHTML =
       '<div style="color:var(--text-muted);padding:20px;text-align:center;font-size:12px;">' +
-      'No on-deck candidates right now — good stocks (conviction 7+) rejected only on R/R ' +
-      'appear here, watched for a price recovery + confirmed uptick.</div>';
+      'No on-deck candidates right now — good short candidates (conviction 7+) rejected only on R/R ' +
+      'appear here, watched for a price rollover + confirmed downtick.</div>';
     return;
   }
   // Signal badge label/class — same mapping updateTickerSignal() uses for the live-push path,
@@ -4570,12 +4573,12 @@ async function appendOnDeckChart(ticker) {
   // exact same object the card already rendered from, rather than duplicating those fields
   // into a second endpoint response.
   const targets = data.dip ? [
-    {rr: data.dip_target_rr, lowT: data.dip.low_t, color: '#60a5fa', label: `20% retrace $${data.dip.retracement_target.toFixed(2)}`},
-    {rr: data.ai_entry_target_rr, lowT: data.dip.low_t, color: '#a78bfa', label: data.ai_entry_price != null ? `AI entry $${data.ai_entry_price.toFixed(2)}` : ''},
+    {rr: data.dip_target_rr, lowT: data.dip.peak_t, color: '#60a5fa', label: `20% retrace $${data.dip.retracement_target.toFixed(2)}`},
+    {rr: data.ai_entry_target_rr, lowT: data.dip.peak_t, color: '#a78bfa', label: data.ai_entry_price != null ? `AI entry $${data.ai_entry_price.toFixed(2)}` : ''},
   ] : [];
   const summaryHtml = which.source === 'ondeck'
     ? dipEntryParagraph(which.obj)
-    : 'On Shore snapshot — not continuously tracked, so there\'s no dip/recovery signal to report here, just the R/R trend over the last 30 days.';
+    : 'On Shore snapshot — not continuously tracked, so there\'s no rally/rollover signal to report here, just the R/R trend over the last 30 days.';
   const rrOpts = {display: chartDisplayConfig, convictionOk: (which.obj.conviction_score || 0) >= _MIN_CONVICTION_GATE, isShore: which.source === 'shore'};
   const chartHtml = `
     <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;">
@@ -4613,12 +4616,12 @@ async function openChartExpand(ticker) {
   if (ticker !== _chartExpandCurrentTicker) return;
 
   const targets = data.dip ? [
-    {rr: data.dip_target_rr, lowT: data.dip.low_t, color: '#60a5fa', label: `20% retrace $${data.dip.retracement_target.toFixed(2)}`},
-    {rr: data.ai_entry_target_rr, lowT: data.dip.low_t, color: '#a78bfa', label: data.ai_entry_price != null ? `AI entry $${data.ai_entry_price.toFixed(2)}` : ''},
+    {rr: data.dip_target_rr, lowT: data.dip.peak_t, color: '#60a5fa', label: `20% retrace $${data.dip.retracement_target.toFixed(2)}`},
+    {rr: data.ai_entry_target_rr, lowT: data.dip.peak_t, color: '#a78bfa', label: data.ai_entry_price != null ? `AI entry $${data.ai_entry_price.toFixed(2)}` : ''},
   ] : [];
   const summaryHtml = which.source === 'ondeck'
     ? dipEntryParagraph(which.obj)
-    : 'On Shore snapshot — not continuously tracked, so there\'s no dip/recovery signal to report here, just the R/R trend over the last 30 days.';
+    : 'On Shore snapshot — not continuously tracked, so there\'s no rally/rollover signal to report here, just the R/R trend over the last 30 days.';
   const rrOpts = {display: chartDisplayConfig, convictionOk: (which.obj.conviction_score || 0) >= _MIN_CONVICTION_GATE, isShore: which.source === 'shore'};
   document.getElementById('chartExpandTitle').textContent = `${ticker} — Full R/R History (${(data.points||[]).length} points)`;
   document.getElementById('chartExpandBody').innerHTML = `

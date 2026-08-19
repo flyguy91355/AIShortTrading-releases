@@ -319,18 +319,20 @@ Respond with ONLY the JSON object, no other text.
 
 
 ANALYSIS_PROMPT = """\
-You are a senior equity research analyst. Analyze the following stock data and produce a structured investment recommendation.
+You are a senior equity research analyst specializing in SHORT-SELLING. This system exclusively opens SHORT positions — it never buys stock expecting it to rise. Analyze the following stock data and produce a structured recommendation for a short sale (or a decision to pass).
+
+CRITICAL — WHAT "BUY"/"STRONG BUY" MEANS HERE: in this system's own signal vocabulary, a "BUY" or "STRONG BUY" signal means "open a SHORT position on this stock" (borrow shares and sell them now, planning to buy them back later at a lower price) — it does NOT mean purchase shares expecting the price to rise. You are looking for stocks you believe are OVERVALUED, deteriorating, or likely to DECLINE — weak fundamentals, negative catalysts, deteriorating technicals, insider selling, bearish sentiment. A cheap, undervalued, or improving stock is a poor short candidate regardless of how attractive it would be to a long-only buyer — do not recommend BUY/STRONG BUY for a stock you expect to rise. "SELL"/"STRONG SELL" means you'd actively avoid or close a short on this name (e.g. it looks poised to rise, squeezing a short), and "HOLD" means neither a compelling short nor a reason to avoid one.
 
 TODAY'S DATE: {current_date} — any event, quarter, or timeframe you reference must be realistic relative to this date. Never reference a quarter, month, or year that has already passed.
 
 IMPORTANT RULES:
 - Be conservative. The cardinal rule is NEVER LOSE MONEY.
-- Only recommend BUY or STRONG BUY if conviction is {min_conviction:.1f}/10 or higher.
-- Every recommendation MUST include a stop loss.
+- Only recommend BUY or STRONG BUY (i.e. recommend shorting) if conviction is {min_conviction:.1f}/10 or higher.
+- Every recommendation MUST include a stop loss, placed ABOVE the entry price (the level at which a rising price would force covering the short at a loss).
 - Risk/reward ratio must be at least {rr_base:.1f}:1 for a stock right at the {min_conviction:.1f}/10 conviction minimum, scaling down modestly for higher conviction — never below {rr_floor:.1f}:1 regardless of how high conviction is.
 - If the data is insufficient or unclear, recommend NO ACTION.
 - Every numeric field you output (entry_price, stop_loss, take_profit_targets) must be used consistently everywhere else in your response, including inside reasoning — if you cite risk/reward math or a specific target price in reasoning, it must match the actual entry_price/stop_loss/take_profit_targets values you output, and "first target" must mean take_profit_targets[0], not a later one.
-- If a LONG-TERM TREND section is present below, weigh it explicitly: judge whether the current setup looks like a genuine fundamental turnaround versus a bounce back toward a level the stock has already failed at before.
+- If a LONG-TERM TREND section is present below, weigh it explicitly: judge whether the current setup looks like a genuine breakdown/overvaluation versus the stock simply returning to a level it has already bounced from before.
 
 STOCK: {ticker} — {company_name}
 CURRENT PRICE: ${current_price:.2f}
@@ -356,16 +358,16 @@ Based on all of the above, provide your analysis as JSON with these exact fields
     "signal": "<STRONG BUY|BUY|HOLD|SELL|STRONG SELL|NO ACTION>",
     "risk_level": "<LOW|MODERATE|HIGH>",
     "business_summary": "<1-2 factual sentences on what the company actually makes, sells, or operates — not an investment opinion, just what the business is>",
-    "thesis": "<2-3 sentence investment thesis>",
-    "risk_factors": "<key risks that could invalidate the thesis>",
+    "thesis": "<2-3 sentence case for (or against) shorting this stock>",
+    "risk_factors": "<key risks that could invalidate the short thesis — e.g. what could make the price rise and squeeze the short>",
     "recommended_action": "<specific action to take>",
-    "entry_price": <recommended entry price as number>,
+    "entry_price": <recommended price to sell short at, as a number>,
     {stop_tp_instructions}
     "position_size_pct": <recommended position size as % of portfolio, 1-10>,
     "time_horizon": "<days|weeks|months>",
     "reasoning": "<detailed reasoning connecting all research dimensions>",
     "fair_value_estimate": <quick intrinsic value estimate as a number>,
-    "margin_of_safety_pct": <percentage below fair value the current price represents — negative if overvalued>
+    "margin_of_safety_pct": <percentage the CURRENT PRICE sits ABOVE fair value — how overvalued this looks, i.e. how much downside a short has if price reverts to fair value; negative if the stock still looks UNDERVALUED (a poor short candidate)>
 }}
 
 Respond with ONLY the JSON object, no other text.
@@ -408,26 +410,30 @@ def _build_market_context_section(market_change_pct: float | None) -> str:
     failed (None), same graceful-omission pattern every other optional section here uses
     -- never fabricates a market condition.
 
-    Owner's explicit direction, not left to open-ended AI judgment alone: a broadly up
-    market should generally be a favorable day to take new positions (don't sit in cash
-    waiting when the fundamentals/technicals already support a buy); a broadly down
-    market calls for more caution and selectivity. Framed as a real, weighable factor
-    alongside everything else in the prompt, not a mechanical override -- consistent with
-    this project's standing preference for giving real data + framing and trusting
-    Claude's judgment rather than hardcoding a rule."""
+    Owner's explicit direction (inverted for short economics, 2026-08-19 -- see
+    AITrading's own version of this function for the original long-only lean this
+    mirrors), not left to open-ended AI judgment alone: a broadly down market should
+    generally be a favorable day to open new shorts (don't sit in cash waiting when the
+    fundamentals/technicals already support a short); a broadly up market calls for more
+    caution and selectivity, since a rising tide can squeeze a short regardless of the
+    individual stock's own weakness. Framed as a real, weighable factor alongside
+    everything else in the prompt, not a mechanical override -- consistent with this
+    project's standing preference for giving real data + framing and trusting Claude's
+    judgment rather than hardcoding a rule."""
     if market_change_pct is None:
         return ""
     direction = "up" if market_change_pct >= 0 else "down"
     return (
         f"\n── TODAY'S MARKET ──\n"
         f"S&P 500 (SPY): {market_change_pct:+.2f}% today — the broad market is {direction} "
-        f"today. Weigh this as a real factor: a stock's own price strength on a day the "
-        f"broader market is also strongly up may partly reflect market-wide momentum "
-        f"(beta) rather than something unique to this company -- but a broadly up market "
-        f"is generally a favorable environment for taking new positions, so don't be "
-        f"reflexively conservative if the fundamentals and technicals already support a "
-        f"buy. On a broadly down market, be more selective and cautious, since risk is "
-        f"elevated market-wide.\n"
+        f"today. Weigh this as a real factor: a stock's own price weakness on a day the "
+        f"broader market is also broadly down may partly reflect market-wide momentum "
+        f"(beta) rather than something unique to this company -- but a broadly down "
+        f"market is generally a favorable environment for opening new shorts, so don't be "
+        f"reflexively conservative if the fundamentals and technicals already support "
+        f"one. On a broadly up market, be more selective and cautious about new shorts, "
+        f"since a rising tide can squeeze a short position even in a genuinely weak "
+        f"stock.\n"
     )
 
 
@@ -632,50 +638,53 @@ class ResearchEngine:
         peak_days_ago: float | None = None, low_days_ago: float | None = None,
         market_cap: float | None = None,
     ) -> tuple[float | None, str, bool] | None:
-        """Recommends a specific entry price given a REAL, already-observed dip that has
-        started recovering — added 2026-07-18 as the "ai" alternative to the mechanical
-        peak-to-low retracement-% entry mode. Deliberately NOT called at routine pre-open
-        analysis time: per the user's own reasoning, Claude can't meaningfully predict a
-        pullback entry price before the dip has actually happened — a specific price
-        recommendation is only informed once there's a real peak, a real low, and a real
-        recovery already underway to reason about. near_miss_monitor_loop is the only
-        caller, firing this once when it detects that shape (see its docstring for the
-        exact trigger condition), not on every 60s tick.
+        """Recommends a specific SHORT entry price given a REAL, already-observed rally
+        that has started rolling over — added 2026-07-18 as the "ai" alternative to the
+        mechanical low-to-peak retracement-% entry mode (short economics, 2026-08-19: the
+        mirror of AITrading's own dip-and-recovery feature — this system watches for a
+        rally that rolls over, not a dip that recovers). Deliberately NOT called at
+        routine pre-open analysis time: per the user's own reasoning, Claude can't
+        meaningfully predict a rollover entry price before the rally has actually
+        happened — a specific price recommendation is only informed once there's a real
+        low, a real peak, and a real rollover already underway to reason about.
+        near_miss_monitor_loop is the only caller, firing this once when it detects that
+        shape (see its docstring for the exact trigger condition), not on every 60s tick.
 
-        peak_days_ago/low_days_ago (2026-07-28, RRC/OVV incident) — how long ago the
-        peak/low actually happened, in days. Before this, the prompt gave Claude only three
-        bare prices with no sense of time at all, so it had no way to notice when a "dip"
-        was actually just wherever a multi-week trend happened to start (the mechanical
-        peak-to-low search over a long window finds the single lowest point regardless of
-        how old it is — see dip_summary's docstring). Both RRC and OVV were bought this way:
-        their "recent low" was several weeks stale, the stock had been trending steadily the
-        whole time with no real recent pullback, and the system bought into (in OVV's case)
-        an active decline because the mechanical "price is above the old low" check was
-        already trivially true. Giving Claude the real elapsed time lets it judge staleness
-        itself rather than trusting a hardcoded day cutoff — see the prompt's explicit
-        instruction to decline when the pattern doesn't hold up. Optional (defaults to None
-        -> omitted from the prompt) only so an old caller/test that hasn't been updated yet
-        doesn't outright break; every real caller always supplies both.
+        peak_days_ago/low_days_ago (mirrors AITrading's 2026-07-28 RRC/OVV incident fix)
+        — how long ago the peak/low actually happened, in days. Without this, the prompt
+        would give Claude only three bare prices with no sense of time at all, so it
+        would have no way to notice when a "rally" was actually just wherever a
+        multi-week decline happened to start (the mechanical low-to-peak search over a
+        long window finds the single highest point regardless of how old it is — see
+        dip_summary's docstring). The PEAK's own staleness is the critical signal here
+        (the mirror of AITrading's low-staleness concern): a stale peak from weeks ago
+        that the stock simply hasn't revisited since means there's no real current
+        rollover to short, even though price happens to sit below that old peak right
+        now. Giving Claude the real elapsed time lets it judge staleness itself rather
+        than trusting a hardcoded day cutoff — see the prompt's explicit instruction to
+        decline when the pattern doesn't hold up. Optional (defaults to None -> omitted
+        from the prompt) only so an old caller/test that hasn't been updated yet doesn't
+        outright break; every real caller always supplies both.
 
         Returns None on any failure (no API key, malformed response, API error) — never
         fabricates a number, same AI Data Integrity principle as every other real trading
         figure in this codebase. Returns (None, reason, stale) when Claude explicitly
-        judges this isn't a genuine, current uptrend worth entering — a real, reasoned
+        judges this isn't a genuine, current breakdown worth shorting — a real, reasoned
         "no", distinct from an outright failure, and the caller must NOT treat it as an
-        error to retry blindly (see _compute_ai_dip_entry). `stale` (2026-07-30, On Deck
-        auto-removal feature) is Claude's own judgment of whether this decline will
-        never resolve itself (a genuinely stale reference point the stock has moved on
-        from — worth evicting from On Deck so a fresh candidate can take the slot) versus
-        one that's still legitimately developing (too early/fresh — worth continuing to
-        monitor as-is). Always False when entry_price is a real number (irrelevant in
-        that case). Uses its own model_dip_entry setting (2026-07-24, split off from the
-        shared model_quick_scan default so this can be tuned independently of the live
-        buy pipeline — see CLAUDE.md's "Model Selection" section).
+        error to retry blindly (see _compute_ai_dip_entry). `stale` (mirrors AITrading's
+        2026-07-30 On Deck auto-removal feature) is Claude's own judgment of whether this
+        rally will never roll over (a genuinely stale reference point the stock has moved
+        on from — worth evicting from On Deck so a fresh candidate can take the slot)
+        versus one that's still legitimately developing (too early/fresh — worth
+        continuing to monitor as-is). Always False when entry_price is a real number
+        (irrelevant in that case). Uses its own model_dip_entry setting (split off from
+        the shared model_quick_scan default so this can be tuned independently of the
+        live buy pipeline — see CLAUDE.md's "Model Selection" section).
 
-        market_cap (2026-08-04, "billion dollar stock" discussion) — optional dollar
-        market cap, converted to a human-readable size tier via _market_cap_tier_label.
-        Before this, the staleness judgment above had zero information about company
-        size and applied the same generic "is N days old too stale" instinct to a small
+        market_cap ("billion dollar stock" discussion) — optional dollar market cap,
+        converted to a human-readable size tier via _market_cap_tier_label. Without this,
+        the staleness judgment above would have zero information about company size and
+        would apply the same generic "is N days old too stale" instinct to a small
         volatile stock and a stable mega-cap alike, even though a larger company's
         support/resistance levels reasonably persist longer. This doesn't loosen or
         remove the staleness judgment itself (the user explicitly values the real,
@@ -685,58 +694,59 @@ class ResearchEngine:
         peak_days_ago/low_days_ago already use.
 
         Also fetches today's broad-market context (S&P 500 % change) via
-        _build_market_context_section (2026-08-04, "shouldn't the AI know if the
-        market's up or down" discussion) -- same shared section analyze_stock's prompt
-        now includes."""
+        _build_market_context_section -- same shared section analyze_stock's prompt
+        includes."""
         if not self.client:
             return None
         market_change_pct = await self.market_data.get_market_change_pct()
         market_context_section = _build_market_context_section(market_change_pct)
         cap_tier = _market_cap_tier_label(market_cap) if market_cap else ""
         cap_line = f"\nCompany size: {cap_tier} (~${market_cap/1e9:.1f}B market cap)" if cap_tier else ""
-        peak_age_line = (f"Recent peak (before the dip): ${peak:.2f}, {peak_days_ago:.1f} day(s) ago"
-                          if peak_days_ago is not None else f"Recent peak (before the dip): ${peak:.2f}")
-        low_age_line = (f"Recent low (the bottom of the dip): ${low:.2f}, {low_days_ago:.1f} day(s) ago"
-                         if low_days_ago is not None else f"Recent low (the bottom of the dip): ${low:.2f}")
+        peak_age_line = (f"Recent peak (the top of the rally): ${peak:.2f}, {peak_days_ago:.1f} day(s) ago"
+                          if peak_days_ago is not None else f"Recent peak (the top of the rally): ${peak:.2f}")
+        low_age_line = (f"Recent low (before the rally): ${low:.2f}, {low_days_ago:.1f} day(s) ago"
+                         if low_days_ago is not None else f"Recent low (before the rally): ${low:.2f}")
         prompt = f"""\
-A stock you previously analyzed has dipped and is now showing real signs of recovery —
-this is an observed price pattern, not a prediction. Given this actual price action,
-judge whether this is a genuine, CURRENT uptrend worth entering, and if so, recommend a
-specific entry price.
+A stock you previously analyzed has rallied and is now showing real signs of rolling
+over — this is an observed price pattern, not a prediction. Given this actual price
+action, judge whether this is a genuine, CURRENT breakdown worth shorting, and if so,
+recommend a specific short entry price.
 
 STOCK: {ticker} — {company_name}{cap_line}
 Your prior thesis: {thesis}
 Fair value estimate: ${fair_value_estimate:.2f}
 {peak_age_line}
 {low_age_line}
-Current price (recovering off the low): ${current_price:.2f}
+Current price (rolling over off the peak): ${current_price:.2f}
 {market_context_section}
-Use the elapsed time above as real information, not decoration: a low from many days or
-weeks ago that the stock simply hasn't revisited since (because it's been trending steadily
-in one direction the whole time) is NOT a current dip-and-recovery worth acting on, even
-though the current price happens to sit above that old low. A genuine entry signal needs a
-low that's recent enough to still be a meaningful, active reference point for where this
-stock trades right now. If the pattern doesn't hold up under that scrutiny, say so and
-decline — do not force a price recommendation onto a stale or unconvincing setup.
+Use the elapsed time above as real information, not decoration: a peak from many days or
+weeks ago that the stock simply hasn't revisited since (because it's been declining
+steadily in one direction the whole time) is NOT a current rally-and-rollover worth
+acting on, even though the current price happens to sit below that old peak. A genuine
+short entry signal needs a peak that's recent enough to still be a meaningful, active
+reference point for where this stock trades right now. If the pattern doesn't hold up
+under that scrutiny, say so and decline — do not force a price recommendation onto a
+stale or unconvincing setup.
 
 Weigh company size when judging what "recent enough" means: a large, stable company's
-support levels typically persist and stay relevant far longer than a small, volatile
-stock's — a low from several weeks ago can still be a genuine, active reference point for
-a steady mega-cap, where the identical elapsed time might already be stale for a small-cap
-that moves fast. Don't apply one generic staleness window to every stock regardless of size.
+resistance levels typically persist and stay relevant far longer than a small, volatile
+stock's — a peak from several weeks ago can still be a genuine, active reference point
+for a steady mega-cap, where the identical elapsed time might already be stale for a
+small-cap that moves fast. Don't apply one generic staleness window to every stock
+regardless of size.
 
-If you judge this a genuine current uptrend: considering technical support levels, how much
-it has already recovered, and the fair value estimate, what price would represent a good
-entry point? It should be a real, reasoned price level — not simply an arbitrary percentage
-off the low.
+If you judge this a genuine current breakdown: considering technical resistance levels,
+how much it has already rolled over, and the fair value estimate, what price would
+represent a good short entry point? It should be a real, reasoned price level — not
+simply an arbitrary percentage off the peak.
 
 Respond with ONLY a JSON object:
-- If this is a genuine entry opportunity: {{"entry_price": <number>, "reasoning": "<one sentence>"}}
-- If you decline because the reference low itself is the problem — genuinely stale,
+- If this is a genuine short entry opportunity: {{"entry_price": <number>, "reasoning": "<one sentence>"}}
+- If you decline because the reference peak itself is the problem — genuinely stale,
   already fully priced in, or otherwise unlikely to ever become a meaningful CURRENT
   setup again (the stock has simply moved on from it): {{"entry_price": null, "reasoning": "<one sentence>", "stale": true}}
-- If you decline for any other reason — e.g. the recovery is real but still too early/
-  fresh to act on yet, and this same low may still develop into a genuine entry soon:
+- If you decline for any other reason — e.g. the rollover is real but still too early/
+  fresh to act on yet, and this same peak may still develop into a genuine entry soon:
   {{"entry_price": null, "reasoning": "<one sentence>", "stale": false}}
 """
         model = self.config.get("research", {}).get("model_dip_entry", "claude-haiku-4-5")
@@ -1028,12 +1038,12 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         if research_cfg.get("ai_chosen_stop_tp_enabled", False):
             stop_tp_instructions = (
                 '"stop_loss": <stop loss price as number — judge a specific level from '
-                'the real Support/Resistance/SMA/RSI data above; place it just below a '
-                'genuine support level or recent swing low, not an arbitrary percentage '
+                'the real Support/Resistance/SMA/RSI data above; place it just above a '
+                'genuine resistance level or recent swing high, not an arbitrary percentage '
                 'off entry>,\n'
-                '    "take_profit_targets": [<T1, T2, T3 — three ascending price levels '
-                'judged from real resistance levels and the fair value estimate, not a '
-                'fixed percentage above entry>],'
+                '    "take_profit_targets": [<T1, T2, T3 — three descending price levels '
+                'judged from real support levels and the fair value estimate, not a '
+                'fixed percentage below entry>],'
             )
         else:
             sl_pct = tp_cfg.get("stop_loss_pct", 7.0)
@@ -1041,9 +1051,9 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             t2_pct = tp_cfg.get("t2_pct", 10.0)
             t3_pct = tp_cfg.get("t3_pct", 17.0)
             stop_tp_instructions = (
-                f'"stop_loss": <stop loss price as number — target {sl_pct:.0f}% below entry>,\n'
-                f'    "take_profit_targets": [<T1 — ~{t1_pct:.0f}% above entry>, '
-                f'<T2 — ~{t2_pct:.0f}% above entry>, <T3 — ~{t3_pct:.0f}% above entry>],'
+                f'"stop_loss": <stop loss price as number — target {sl_pct:.0f}% above entry>,\n'
+                f'    "take_profit_targets": [<T1 — ~{t1_pct:.0f}% below entry>, '
+                f'<T2 — ~{t2_pct:.0f}% below entry>, <T3 — ~{t3_pct:.0f}% below entry>],'
             )
         return ANALYSIS_PROMPT.format(
             current_date=self._now_et().strftime("%Y-%m-%d"),

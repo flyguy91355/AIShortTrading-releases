@@ -1,7 +1,7 @@
 {
-  "name": "Hilton's AITrading",
-  "short_name": "Hilton's AITrading",
-  "description": "AI-Powered Stock Research & Autonomous Trading Dashboard",
+  "name": "Doug's AIShortTrading",
+  "short_name": "AIShortTrading",
+  "description": "AI-Powered Short-Selling Research & Autonomous Trading Dashboard",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0a0e17",
