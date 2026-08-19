@@ -985,11 +985,18 @@ class OrderManager:
         return await self._execute_buy(signal)
 
     async def _execute_buy(self, signal) -> Order | None:
+        # Opens a SHORT (2026-08-19) -- AIShortTrading only ever shorts. Whole-share
+        # quantity, not notional: Alpaca does not support fractional short sales ("We
+        # do not support short sales in fractional orders. All fractional sell orders
+        # are marked long." -- Alpaca fractional-trading docs, verified before this
+        # change). signal.shares is expected to already be a whole-share count
+        # (compute_short_shares in web/app.py) by the time it reaches this function.
         order = Order(
             ticker=signal.ticker,
-            side=OrderSide.BUY,
+            side=OrderSide.SELL,
             order_type=OrderType.MARKET,
-            notional_value=round(signal.position_size_dollars, 2),
+            quantity=signal.shares,
+            position_intent="sell_to_open",
         )
 
         result = await self.broker.submit_order(order)
@@ -1126,15 +1133,16 @@ class OrderManager:
             stop_ok = False  # about to attempt; only True once a submit actually succeeds
             try:
                 stop_order = Order(
-                    ticker=ticker, side=OrderSide.SELL,
+                    ticker=ticker, side=OrderSide.BUY,
                     order_type=OrderType.STOP,
                     quantity=stop_shares,
                     stop_price=round(stop_price, 2),
+                    position_intent="buy_to_close",
                 )
                 stop_result = await self.broker.submit_order(stop_order)
                 self.active_orders[stop_result.broker_order_id] = stop_result
                 self._stop_order_ids[ticker] = stop_result.broker_order_id
-                logger.info("Stop placed for %s: %.4g shares @ $%.2f", ticker, stop_shares, stop_price)
+                logger.info("Buy-to-close stop placed for %s: %.4g shares @ $%.2f", ticker, stop_shares, stop_price)
                 stop_ok = True
             except Exception as e:
                 err_str = str(e).lower()
@@ -1170,14 +1178,15 @@ class OrderManager:
                     )
                     try:
                         market_order = Order(
-                            ticker=ticker, side=OrderSide.SELL,
+                            ticker=ticker, side=OrderSide.BUY,
                             order_type=OrderType.MARKET,
                             quantity=shares,
+                            position_intent="buy_to_close",
                         )
                         market_result = await self.broker.submit_order(market_order)
                         self.active_orders[market_result.broker_order_id] = market_result
                         logger.info(
-                            "Market sell submitted for %s (%.4g shares) — stop was already breached",
+                            "Market buy-to-close submitted for %s (%.4g shares) — stop was already breached",
                             ticker, shares,
                         )
                         stop_ok = True
@@ -1205,14 +1214,15 @@ class OrderManager:
                                 )
                                 try:
                                     market_order = Order(
-                                        ticker=ticker, side=OrderSide.SELL,
+                                        ticker=ticker, side=OrderSide.BUY,
                                         order_type=OrderType.MARKET,
                                         quantity=available,
+                                        position_intent="buy_to_close",
                                     )
                                     market_result = await self.broker.submit_order(market_order)
                                     self.active_orders[market_result.broker_order_id] = market_result
                                     logger.info(
-                                        "Market sell submitted for %s (%.4g shares, "
+                                        "Market buy-to-close submitted for %s (%.4g shares, "
                                         "qty-corrected retry) — stop was already breached",
                                         ticker, available,
                                     )
@@ -1239,14 +1249,15 @@ class OrderManager:
                                 await asyncio.sleep(2)
                                 try:
                                     market_order = Order(
-                                        ticker=ticker, side=OrderSide.SELL,
+                                        ticker=ticker, side=OrderSide.BUY,
                                         order_type=OrderType.MARKET,
                                         quantity=shares,
+                                        position_intent="buy_to_close",
                                     )
                                     market_result = await self.broker.submit_order(market_order)
                                     self.active_orders[market_result.broker_order_id] = market_result
                                     logger.info(
-                                        "Market sell submitted for %s (%.4g shares, "
+                                        "Market buy-to-close submitted for %s (%.4g shares, "
                                         "available:0 retry) — stop was already breached",
                                         ticker, shares,
                                     )
@@ -1280,16 +1291,17 @@ class OrderManager:
                     await asyncio.sleep(3)
                     try:
                         stop_order = Order(
-                            ticker=ticker, side=OrderSide.SELL,
+                            ticker=ticker, side=OrderSide.BUY,
                             order_type=OrderType.STOP,
                             quantity=stop_shares,
                             stop_price=round(stop_price, 2),
+                            position_intent="buy_to_close",
                         )
                         stop_result = await self.broker.submit_order(stop_order)
                         self.active_orders[stop_result.broker_order_id] = stop_result
                         self._stop_order_ids[ticker] = stop_result.broker_order_id
                         logger.info(
-                            "Stop placed for %s: %.4g shares @ $%.2f (wash-trade retry)",
+                            "Buy-to-close stop placed for %s: %.4g shares @ $%.2f (wash-trade retry)",
                             ticker, stop_shares, stop_price,
                         )
                         stop_ok = True
@@ -1316,16 +1328,17 @@ class OrderManager:
                         )
                         try:
                             stop_order = Order(
-                                ticker=ticker, side=OrderSide.SELL,
+                                ticker=ticker, side=OrderSide.BUY,
                                 order_type=OrderType.STOP,
                                 quantity=available,
                                 stop_price=round(stop_price, 2),
+                                position_intent="buy_to_close",
                             )
                             stop_result = await self.broker.submit_order(stop_order)
                             self.active_orders[stop_result.broker_order_id] = stop_result
                             self._stop_order_ids[ticker] = stop_result.broker_order_id
                             logger.info(
-                                "Stop placed for %s: %.4g shares @ $%.2f (qty-corrected retry)",
+                                "Buy-to-close stop placed for %s: %.4g shares @ $%.2f (qty-corrected retry)",
                                 ticker, available, stop_price,
                             )
                             stop_ok = True
@@ -1346,16 +1359,17 @@ class OrderManager:
                         await asyncio.sleep(2)
                         try:
                             stop_order = Order(
-                                ticker=ticker, side=OrderSide.SELL,
+                                ticker=ticker, side=OrderSide.BUY,
                                 order_type=OrderType.STOP,
                                 quantity=stop_shares,
                                 stop_price=round(stop_price, 2),
+                                position_intent="buy_to_close",
                             )
                             stop_result = await self.broker.submit_order(stop_order)
                             self.active_orders[stop_result.broker_order_id] = stop_result
                             self._stop_order_ids[ticker] = stop_result.broker_order_id
                             logger.info(
-                                "Stop placed for %s: %.4g shares @ $%.2f (available:0 retry)",
+                                "Buy-to-close stop placed for %s: %.4g shares @ $%.2f (available:0 retry)",
                                 ticker, stop_shares, stop_price,
                             )
                             stop_ok = True
@@ -1395,26 +1409,28 @@ class OrderManager:
 
             order = Order(
                 ticker=signal.ticker,
-                side=OrderSide.SELL,
+                side=OrderSide.BUY,
                 order_type=OrderType.MARKET,
                 quantity=shares_to_sell,
+                position_intent="buy_to_close",
             )
 
             try:
                 result = await self.broker.submit_order(order)
             except Exception as _sell_err:
                 _err_str = str(_sell_err).lower()
-                # "sold short" (2026-07-22, GitHub #29) -- Alpaca returns a DIFFERENT error
-                # string, "fractional orders cannot be sold short", for the exact same
-                # underlying problem (selling more shares than actually held) whenever the
-                # position involves fractional shares -- confirmed a real, previously-seen
-                # message in this codebase's own incident history (the AMGN race, 2026-07-17).
-                # A whole-share position hits "insufficient qty" instead, already handled
-                # below; fractional positions fell through to the bare re-raise in the `else`
-                # branch with no retry, leaving a conviction-drop-to-0 auto-close silently
-                # failed and the position open with no completed sell.
-                if ("insufficient qty" in _err_str or "insufficient quantity" in _err_str
-                        or "sold short" in _err_str):
+                # "sold short" / "fractional orders cannot be sold short" (Alpaca's
+                # rejection for a LONG-only caller overselling into an accidental
+                # short) deliberately dropped here (2026-08-19) -- AIShortTrading's
+                # equivalent "tried to buy-to-cover more than the short position
+                # holds" rejection text isn't documented anywhere in Alpaca's public
+                # reference and can't be produced without a real short position at a
+                # real broker. "insufficient qty"/"insufficient quantity" are kept --
+                # confirmed generic Alpaca vocabulary used for both directions
+                # elsewhere in this file (_place_stop_only). If a real over-cover
+                # rejection surfaces a distinct string once live credentials exist,
+                # add it here then -- do not guess it now.
+                if "insufficient qty" in _err_str or "insufficient quantity" in _err_str:
                     # Local share count is stale (TP fills reduced Alpaca shares while
                     # system was offline or before our state updated).  Re-sync from
                     # Alpaca and retry once with the real available quantity so the
