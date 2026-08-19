@@ -7918,7 +7918,7 @@ def _restart_service_after_delay():
     request can reach the client before the service (and this very
     process) restarts."""
     time.sleep(2)
-    subprocess.run(["systemctl", "restart", "aitrading"], check=False)
+    subprocess.run(["systemctl", "restart", "aishorttrading"], check=False)
 
 
 @app.post("/api/apply-update")

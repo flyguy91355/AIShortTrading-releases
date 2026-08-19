@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Pull latest code from GitHub and restart AITrading
-# Run on the cloud server: bash /opt/aitrading/scripts/update.sh
+# Pull latest code from GitHub and restart AIShortTrading
+# Run on the cloud server: bash /opt/aishorttrading/scripts/update.sh
 
 set -euo pipefail
-APP_DIR="/opt/aitrading"
-SERVICE="aitrading"
+APP_DIR="/opt/aishorttrading"
+SERVICE="aishorttrading"
 
 echo "Pulling latest code..."
 git -C "$APP_DIR" pull
@@ -15,4 +15,4 @@ echo "Updating dependencies..."
 echo "Restarting service..."
 systemctl restart "$SERVICE"
 sleep 2
-systemctl is-active "$SERVICE" && echo "AITrading restarted OK" || echo "ERROR: check journalctl -u $SERVICE"
+systemctl is-active "$SERVICE" && echo "AIShortTrading restarted OK" || echo "ERROR: check journalctl -u $SERVICE"
