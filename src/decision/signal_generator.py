@@ -76,7 +76,9 @@ class SignalGenerator:
             logger.info("  %s REJECTED: conviction %d < %d", report.ticker, report.conviction_score, min_conviction)
             return None
 
-        risk = report.entry_price - report.stop_loss
+        # Short economics (2026-08-19): stop_loss sits ABOVE entry_price, so risk is
+        # stop_loss - entry_price, the inverse of AITrading's own long-only formula.
+        risk = report.stop_loss - report.entry_price
         if risk <= 0:
             logger.info("  %s REJECTED: risk <= 0 (entry $%.2f, stop $%.2f)", report.ticker, report.entry_price, report.stop_loss)
             return None
@@ -89,7 +91,9 @@ class SignalGenerator:
         if not report.fair_value_estimate or report.fair_value_estimate <= 0:
             logger.info("  %s REJECTED: no valid fair_value_estimate for R/R check", report.ticker)
             return None
-        reward = report.fair_value_estimate - report.entry_price
+        # Short economics: a good short's fair value sits BELOW entry (expected to
+        # fall toward it), so reward is entry_price - fair_value_estimate.
+        reward = report.entry_price - report.fair_value_estimate
         rr = reward / risk if risk > 0 else 0
         # Conviction-scaled gate (fixed 2026-08-09, GitHub #67) -- this used to compare
         # against the flat, un-scaled min_risk_reward_ratio directly, unlike every other

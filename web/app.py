@@ -3965,9 +3965,11 @@ class DashboardState:
             fair_value = cand.get("fair_value_estimate", 0)
             live_price = ranking_quotes.get(t)
             if live_price and stop > 0 and fair_value and fair_value > 0:
-                risk = live_price - stop
+                # Short economics: stop sits above live_price, reward is live_price
+                # falling toward fair_value.
+                risk = stop - live_price
                 if risk > 0:
-                    rr = (fair_value - live_price) / risk
+                    rr = (live_price - fair_value) / risk
                     base += (rr - min_rr) * 2
             return base
 
@@ -4019,12 +4021,12 @@ class DashboardState:
             if current_price <= 0:
                 continue
 
-            # Below stop — don't buy (would immediately stop out)
-            if current_price <= stop_loss:
-                logger.info("%s: price $%.2f at/below stop $%.2f — skipping", ticker, current_price, stop_loss)
+            # At/above stop — don't sell short (would immediately stop out)
+            if current_price >= stop_loss:
+                logger.info("%s: price $%.2f at/above stop $%.2f — skipping", ticker, current_price, stop_loss)
                 continue
 
-            pct_from_entry = (current_price - entry_price) / entry_price * 100
+            pct_from_entry = (entry_price - current_price) / entry_price * 100
 
             # Price moved up significantly — re-verify with a fresh analysis
             if pct_from_entry > price_tolerance_pct:
@@ -4085,13 +4087,13 @@ class DashboardState:
             # R/R check with current buy price — reward side is Claude's fair_value_estimate,
             # not a fixed % target, so it actually discriminates between stocks by real
             # estimated upside rather than producing the same ratio for every candidate.
-            risk = buy_price - stop_loss
+            risk = stop_loss - buy_price
             if not fair_value or fair_value <= 0:
                 entry_obj = self.add_ai_log(ticker, "AUTO_TRADE",
                     "Skipping — no valid fair value estimate for R/R check", "warning")
                 await self.broadcast({"type": "ai_log", "entry": entry_obj})
                 continue
-            rr = (fair_value - buy_price) / risk if risk > 0 else 0
+            rr = (buy_price - fair_value) / risk if risk > 0 else 0
             if rr < min_rr:
                 entry_obj = self.add_ai_log(ticker, "AUTO_TRADE",
                     f"Skipping — R/R {rr:.2f} < {min_rr} at current price ${buy_price:.2f} "
@@ -4425,10 +4427,11 @@ class DashboardState:
             fair_value = d.get("fair_value_estimate", 0.0)
             if entry_price <= 0 or stop_loss <= 0 or fair_value <= 0:
                 continue
-            risk = entry_price - stop_loss
+            # Short economics: stop sits above entry, reward is entry falling to fair_value.
+            risk = stop_loss - entry_price
             if risk <= 0:
                 continue
-            rr = (fair_value - entry_price) / risk
+            rr = (entry_price - fair_value) / risk
             required_rr = _required_rr(conviction, min_conviction, base_rr, rr_step, rr_floor)
             if _on_deck_rr_floor_not_met(rr, required_rr, floor_margin):
                 continue
@@ -4452,7 +4455,7 @@ class DashboardState:
                 "last_price": entry_price,
                 "rr": rr,
                 "required_rr": required_rr,
-                "stop_loss_pct": _derive_stop_pct(
+                "stop_loss_pct": _short_derive_stop_pct(
                     entry_price, stop_loss, self.config["take_profit"]["stop_loss_pct"]),
                 "direction": None,
                 "streak": 0,
@@ -4518,9 +4521,11 @@ class DashboardState:
                     except Exception as e:
                         logger.debug("%s: watchlist R/R live price fetch failed: %s", ticker, e)
                         continue
-                    if price <= 0 or price <= stop_loss:
+                    if price <= 0 or price >= stop_loss:
                         continue
-                    updates[ticker] = (fair_value - price) / (price - stop_loss)
+                    # Short economics: stop sits above price, reward is price falling
+                    # toward fair_value.
+                    updates[ticker] = (price - fair_value) / (stop_loss - price)
                 if updates:
                     await self.broadcast({"type": "watchlist_rr_update", "rr": updates})
             except Exception as e:
@@ -4561,12 +4566,13 @@ class DashboardState:
 
     async def near_miss_monitor_loop(self):
         """Free (yfinance, no Claude) price monitor for near-miss candidates — BUY-signal,
-        conviction-qualified stocks rejected at pre-open only for R/R (too expensive relative
+        conviction-qualified stocks rejected at pre-open only for R/R (too cheap relative
         to fair_value_estimate right now). stop is recomputed off the LIVE price each poll
-        (price * (1 - stop_loss_pct)), not held at the pre-open level — otherwise, as price
-        drops toward a fixed stale stop, (price - stop) shrinks toward zero and R/R would
-        blow up or go negative for the wrong reason. Because stop trails price proportionally,
-        R/R rising as price drops is the intended, correct behavior (more margin of safety),
+        (price * (1 + stop_loss_pct), short economics -- stop sits above price), not held
+        at the pre-open level — otherwise, as price rises toward a fixed stale stop,
+        (stop - price) shrinks toward zero and R/R would blow up or go negative for the
+        wrong reason. Because stop trails price proportionally, R/R rising as price rises
+        away from fair_value is the intended, correct behavior (more margin of safety),
         not a bug.
 
         Promotes on R/R clearing the gate AND a confirmed entry-price recovery, using one of
@@ -4717,10 +4723,11 @@ class DashboardState:
                     # it, causing R/R to blow up or go negative for the wrong reason. Falls
                     # back to the global default for any candidate that predates this field.
                     stop_pct = nm.get("stop_loss_pct", default_stop_pct)
-                    stop = round(price * (1 - stop_pct / 100), 2)
+                    # Short economics: stop sits above price.
+                    stop = round(price * (1 + stop_pct / 100), 2)
                     fair_value = nm["fair_value_estimate"]
-                    risk = price - stop
-                    rr = (fair_value - price) / risk if risk > 0 and fair_value > 0 else -999.0
+                    risk = stop - price
+                    rr = (price - fair_value) / risk if risk > 0 and fair_value > 0 else -999.0
                     nm["rr"] = rr
                     nm["stop_loss"] = stop
                     # Conviction-scaled gate (2026-07-18), not one flat number for every
@@ -5372,7 +5379,7 @@ class DashboardState:
                 if report.entry_price > 0:
                     nm_snapshot["last_price"] = report.entry_price
                 if report.entry_price > 0 and report.stop_loss > 0:
-                    nm_snapshot["stop_loss_pct"] = _derive_stop_pct(
+                    nm_snapshot["stop_loss_pct"] = _short_derive_stop_pct(
                         report.entry_price, report.stop_loss,
                         self.config["take_profit"]["stop_loss_pct"])
                 if rr_val is not None:
@@ -5405,9 +5412,10 @@ class DashboardState:
                     _refresh_nm_from_report()
                 return
 
-            risk = report.entry_price - report.stop_loss
+            # Short economics: stop sits above entry, reward is entry falling to fair_value.
+            risk = report.stop_loss - report.entry_price
             fair_value = report.fair_value_estimate
-            rr = (fair_value - report.entry_price) / risk if risk > 0 and fair_value > 0 else 0.0
+            rr = (report.entry_price - fair_value) / risk if risk > 0 and fair_value > 0 else 0.0
             rr_step = self.config["research"].get("on_deck_rr_conviction_step", 0.1)
             rr_floor = self.config["research"].get("on_deck_rr_floor", 1.5)
             min_rr = _required_rr(report.conviction_score, min_conviction, base_rr, rr_step, rr_floor)
@@ -5797,9 +5805,10 @@ class DashboardState:
                 if "Quick screen passed" not in r[3] and not r[3].startswith("Not added")
             ][:80]
 
-            total_value = self.portfolio.cash + sum(
-                p.shares * p.current_price for p in self.portfolio.positions.values()
-            )
+            # Uses Portfolio.total_value directly (not a local re-derivation) so this
+            # can't drift from the short-side cash model (2026-08-19) the way a second
+            # independent "cash + positions" computation already had.
+            total_value = self.portfolio.total_value
             day_start = self.portfolio.day_start_value
             day_pnl = total_value - day_start if day_start else 0.0
             day_pnl_pct = (day_pnl / day_start * 100) if day_start else 0.0
@@ -6074,8 +6083,9 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         rr_floor = self.config["research"].get("on_deck_rr_floor", 1.5)
         if not report.fair_value_estimate or report.fair_value_estimate <= 0:
             return False, 0.0, base_rr
-        risk = report.entry_price - report.stop_loss
-        rr = (report.fair_value_estimate - report.entry_price) / risk if risk > 0 else 0
+        # Short economics: stop sits above entry, reward is entry falling to fair_value.
+        risk = report.stop_loss - report.entry_price
+        rr = (report.entry_price - report.fair_value_estimate) / risk if risk > 0 else 0
         required = _required_rr(report.conviction_score, min_conviction, base_rr, rr_step, rr_floor)
         return rr >= required, rr, required
 
@@ -6102,7 +6112,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             "last_price": report.entry_price,
             "rr": rr_val,
             "required_rr": base_rr,  # placeholder — caller overwrites with the real value
-            "stop_loss_pct": _derive_stop_pct(
+            "stop_loss_pct": _short_derive_stop_pct(
                 report.entry_price, report.stop_loss,
                 self.config["take_profit"]["stop_loss_pct"]),
             "direction": None,
@@ -6276,9 +6286,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             stop_loss = d.get("stop_loss", 0.0)
             fair_value = d.get("fair_value_estimate", 0.0)
             conviction = d.get("conviction", 0)
-            if entry_price <= 0 or stop_loss <= 0 or fair_value <= 0 or entry_price <= stop_loss:
+            if entry_price <= 0 or stop_loss <= 0 or fair_value <= 0 or entry_price >= stop_loss:
                 return (False, float("-inf"))
-            rr = (fair_value - entry_price) / (entry_price - stop_loss)
+            # Short economics: stop sits above entry, reward is entry falling to fair_value.
+            rr = (entry_price - fair_value) / (stop_loss - entry_price)
             required_rr = _required_rr(
                 conviction, min_conviction,
                 self.config["research"]["min_risk_reward_ratio"],
@@ -6564,7 +6575,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 break
             raw = self.research_reports.get(ticker, {})
             stop_loss = raw.get("stop_loss", 0.0)
-            stop_pct = _derive_stop_pct(raw.get("entry_price", 0.0), stop_loss, default_stop_pct)
+            stop_pct = _short_derive_stop_pct(raw.get("entry_price", 0.0), stop_loss, default_stop_pct)
             required_rr = _required_rr_for(r)
             rr_val = r.get("rr", 0.0)
             if _on_deck_rr_above_gate(rr_val, required_rr):
@@ -6800,7 +6811,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             nm["last_price"] = report.entry_price
             nm["rr"] = rr_val
             nm["required_rr"] = required_rr
-            nm["stop_loss_pct"] = _derive_stop_pct(
+            nm["stop_loss_pct"] = _short_derive_stop_pct(
                 report.entry_price, report.stop_loss, self.config["take_profit"]["stop_loss_pct"])
             nm["direction"] = None
             nm["streak"] = 0
@@ -8118,10 +8129,11 @@ async def get_today_scan_rejects():
         # Fall back to this morning's entry_price if the live quote failed -- same fail-open
         # principle used everywhere else a live price feed can be unavailable.
         live_price = quotes.get(ticker) or entry_price
-        stop_pct = _derive_stop_pct(entry_price, stop_loss, default_stop_pct)
-        live_stop = live_price * (1 - stop_pct / 100)
-        risk = live_price - live_stop
-        rr = (fair_value - live_price) / risk if risk > 0 and fair_value > 0 else 0.0
+        stop_pct = _short_derive_stop_pct(entry_price, stop_loss, default_stop_pct)
+        # Short economics: stop sits above live_price.
+        live_stop = live_price * (1 + stop_pct / 100)
+        risk = live_stop - live_price
+        rr = (live_price - fair_value) / risk if risk > 0 and fair_value > 0 else 0.0
         required_rr = _required_rr(conviction, min_conviction, base_rr, rr_step, rr_floor)
         margin = r.get("margin_of_safety_pct", 0.0) or 0.0
         score = conviction + margin / 10 + (rr - required_rr) * 2
@@ -8233,7 +8245,7 @@ async def get_today_scan_reject_history(ticker: str):
     stop_loss = r.get("stop_loss", 0.0) or 0.0
     fair_value = r.get("fair_value_estimate", 0.0) or 0.0
     default_stop_pct = state.config["take_profit"]["stop_loss_pct"]
-    stop_loss_pct = _derive_stop_pct(entry_price, stop_loss, default_stop_pct)
+    stop_loss_pct = _short_derive_stop_pct(entry_price, stop_loss, default_stop_pct)
     try:
         quote = await state.market_data.get_quote(ticker)
         live_price = quote.price
@@ -8520,11 +8532,12 @@ async def _reconstruct_missing_tp_fills(buys_by_ticker: dict) -> list[dict]:
         pct_by_tranche = {1: t1_pct, 2: t2_pct}
         for tranche in range(1, missing + 1):
             pct = pct_by_tranche.get(tranche, t1_pct)
-            price = round(pos.entry_price * (1 + pct / 100), 2)
+            # Short economics: take-profit sits below entry.
+            price = round(pos.entry_price * (1 - pct / 100), 2)
             estimated.append({
                 "ticker": ticker, "action": "SELL",
                 "shares": round(tranche_shares, 4), "price": price,
-                "pnl": round((price - pos.entry_price) * tranche_shares, 2),
+                "pnl": round((pos.entry_price - price) * tranche_shares, 2),
                 "reason": f"Take-Profit T{tranche} (estimated)",
                 "timestamp": pos.opened_at.isoformat(),
                 "is_estimated": True,
@@ -9299,13 +9312,14 @@ async def manual_buy(payload: dict):
     if stop_loss_pct <= 0:
         raise HTTPException(status_code=400, detail="stop_loss_pct must be > 0 — check Settings")
 
-    stop = round(price * (1 - stop_loss_pct / 100), 2)
-    if stop <= 0 or stop >= price:
+    # Short economics: stop sits above price, take-profit targets sit below it.
+    stop = round(price * (1 + stop_loss_pct / 100), 2)
+    if stop <= price:
         raise HTTPException(status_code=400, detail=f"Computed stop loss ${stop:.2f} is invalid for price ${price:.2f}")
     targets = [
-        round(price * (1 + t1_pct / 100), 2),
-        round(price * (1 + t2_pct / 100), 2),
-        round(price * (1 + t3_pct / 100), 2),
+        round(price * (1 - t1_pct / 100), 2),
+        round(price * (1 - t2_pct / 100), 2),
+        round(price * (1 - t3_pct / 100), 2),
     ]
 
     from src.research.engine import ResearchReport, Signal, RiskLevel

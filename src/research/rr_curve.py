@@ -56,11 +56,14 @@ def rr_at_price(price: float, fair_value: float, stop_loss_pct: float) -> float 
     "where would the buy-target price land on the R/R axis" calculation used to plot the
     entry-target line directly on the R/R chart. None if the ratio can't be computed
     (invalid price/fair_value), same as rr_points' per-point behavior.
+
+    Short economics (2026-08-19): the stop sits ABOVE price, and reward is price
+    falling toward fair_value, not fair_value sitting above price.
     """
     stop_pct = stop_loss_pct / 100
-    stop = price * (1 - stop_pct)
-    risk = price - stop
-    return (fair_value - price) / risk if risk > 0 and fair_value > 0 else None
+    stop = price * (1 + stop_pct)
+    risk = stop - price
+    return (price - fair_value) / risk if risk > 0 and fair_value > 0 else None
 
 
 def rr_points(price_history: list[tuple[float, float]], fair_value: float, stop_loss_pct: float) -> list[dict]:

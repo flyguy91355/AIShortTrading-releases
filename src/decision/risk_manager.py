@@ -35,7 +35,10 @@ class RiskManager:
         self.wash_sale_cooldown_days = config.get("research", {}).get("wash_sale_cooldown_days", 30)
 
     def calculate_position_size(self, entry_price: float, stop_loss: float, portfolio_value: float) -> float:
-        risk_per_share = entry_price - stop_loss
+        # Short economics (2026-08-19): stop_loss sits ABOVE entry_price, so risk/share
+        # is stop_loss - entry_price, not entry_price - stop_loss (the inverse of
+        # AITrading's own long-only formula).
+        risk_per_share = stop_loss - entry_price
         if risk_per_share <= 0:
             return 0.0
 

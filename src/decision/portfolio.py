@@ -205,15 +205,17 @@ class Position:
 
     @property
     def day_pnl(self) -> float:
+        # Short economics (2026-08-19): a short profits when price falls during the
+        # day, so this is ref - current, not current - ref.
         ref = self.day_open_price if self.day_open_price is not None else self.entry_price
-        return (self.current_price - ref) * self.shares
+        return (ref - self.current_price) * self.shares
 
     @property
     def day_pnl_pct(self) -> float:
         ref = self.day_open_price if self.day_open_price is not None else self.entry_price
         if not ref:
             return 0.0
-        return ((self.current_price - ref) / ref) * 100
+        return ((ref - self.current_price) / ref) * 100
 
 
 class Portfolio:
@@ -249,8 +251,12 @@ class Portfolio:
 
     @property
     def total_value(self) -> float:
+        # Short economics (2026-08-19): add_position already credits cash with the
+        # sale proceeds at open, so an open short's market_value is what it costs to
+        # buy the shares back -- a LIABILITY against that cash, not an asset to add
+        # to it (the opposite of AITrading's own long-only cash + positions_value).
         positions_value = sum(p.market_value for p in self.positions.values())
-        return self.cash + positions_value
+        return self.cash - positions_value
 
     @property
     def total_pnl(self) -> float:
@@ -635,13 +641,18 @@ class Portfolio:
 
     def add_position(self, position: Position):
         self.positions[position.ticker] = position
-        self.cash -= position.cost_basis
+        # Short economics (2026-08-19, owner-confirmed design): opening a short sells
+        # borrowed shares, which CREDITS cash with the sale proceeds -- the opposite
+        # of AITrading's own long-only debit-to-buy. Simple mirror-image model, not
+        # real margin/buying-power accounting.
+        self.cash += position.cost_basis
 
     def close_position(self, ticker: str) -> float:
         position = self.positions.pop(ticker, None)
         if position is None:
             return 0.0
-        self.cash += position.market_value
+        # Short economics: covering SPENDS cash to buy the shares back.
+        self.cash -= position.market_value
         self.update_peak()
         return position.unrealized_pnl
 
@@ -664,7 +675,7 @@ class Portfolio:
             position = self.positions.pop(ticker, None)
             if position:
                 self.update_peak()
-            pnl = (_exit_price - position.entry_price) * _exit_shares if position else 0
+            pnl = (position.entry_price - _exit_price) * _exit_shares if position else 0  # short economics
         else:
             pnl = self.close_position(ticker)
         await self._remove_position_db(ticker)

@@ -58,12 +58,11 @@ def _classify_stop_exit_reason(fill_price: float, entry_price: float, profit_tar
     about something already known -- only stop-loss vs trailing-stop (and whether the
     dollar profit-target trail was active) was genuinely unresolved there.
 
-    Uses the same fill-price-vs-entry-price signal position_update_loop's own live
-    classification already relies on: a stop-type order filling AT OR ABOVE entry means
-    the trailing stop had armed and ratcheted up before triggering (a profit-preserving
-    exit), while filling BELOW entry means the original stop-loss (never armed, or price
-    gapped through too fast for the trail to matter)."""
-    if fill_price >= entry_price:
+    Short economics (2026-08-19): a stop-type order filling AT OR BELOW entry means
+    the trailing stop had armed and ratcheted down before triggering (a profit-
+    preserving cover), while filling ABOVE entry means the original stop-loss (never
+    armed, or price gapped through too fast for the trail to matter)."""
+    if fill_price <= entry_price:
         return "Profit-target trailing stop hit" if profit_target_hit else "Trailing stop hit"
     return "Stop loss hit"
 
@@ -519,7 +518,7 @@ class OrderManager:
             logger.warning("%s: live quote lookup for unreconciled fill failed (%s)", ticker, e)
         if not price or price <= 0:
             price = entry_price
-        pnl = (price - entry_price) * shares_sold
+        pnl = (entry_price - price) * shares_sold  # short economics (2026-08-19)
         _pos = self.portfolio.positions.get(ticker)
         _trade_id = _pos.trade_id if _pos else None
         self.portfolio.recent_losses[ticker] = datetime.now()
@@ -633,13 +632,13 @@ class OrderManager:
             # still in the middle of filling -- bail out immediately (not just "no
             # match", which would fall through to the guess-based estimate) and let
             # the caller retry once the order reaches a real terminal state.
-            if any(o.get("side") == "sell" and o.get("status") == "partially_filled"
+            if any(o.get("side") == "buy" and o.get("status") == "partially_filled"
                    for o in real_orders):
                 raise FillStillSettlingError(ticker)
 
             sells = [
                 o for o in real_orders
-                if o.get("side") == "sell" and (o.get("filled_qty") or 0) > 0
+                if o.get("side") == "buy" and (o.get("filled_qty") or 0) > 0
                 and o.get("filled_avg_price") is not None and o.get("filled_at")
             ]
             sells.sort(key=lambda o: o["filled_at"])
@@ -715,7 +714,7 @@ class OrderManager:
                 reason = _tranche_reason(starting_tranche + i)
             real_qty = o["filled_qty"]
             real_price = o["filled_avg_price"]
-            pnl = (real_price - entry_price) * real_qty
+            pnl = (entry_price - real_price) * real_qty  # short economics (2026-08-19)
             total_pnl += pnl
             if pnl < 0:
                 self.portfolio.recent_losses[ticker] = datetime.now()
@@ -770,16 +769,20 @@ class OrderManager:
             logger.warning("%s: real-order lookup for entry time failed (%s) — using now()", ticker, e)
             return datetime.now()
 
-        buys = [
+        # Short economics (2026-08-19): the order that OPENED this position is always
+        # a SELL (position_intent=sell_to_open), not a BUY -- this is the opening
+        # order's fill, not a closing one, so the filter direction is the opposite of
+        # every other reconciliation fix in this file.
+        opens = [
             o for o in real_orders
-            if o.get("side") == "buy" and (o.get("filled_qty") or 0) > 0
+            if o.get("side") == "sell" and (o.get("filled_qty") or 0) > 0
             and o.get("filled_at")
         ]
-        buys.sort(key=lambda o: o["filled_at"])
+        opens.sort(key=lambda o: o["filled_at"])
 
         matched = []
         total = 0.0
-        for o in reversed(buys):
+        for o in reversed(opens):
             if total >= target_shares - 0.01:
                 break
             matched.append(o)
@@ -1509,7 +1512,7 @@ class OrderManager:
                 _partial_price = result.filled_price if result.filled_price is not None else position.current_price
                 if self.portfolio._db and _partial_qty > 0:
                     try:
-                        _partial_pnl = (_partial_price - position.entry_price) * _partial_qty
+                        _partial_pnl = (position.entry_price - _partial_price) * _partial_qty  # short economics
                         if _partial_pnl < 0:
                             self.portfolio.recent_losses[signal.ticker] = datetime.now()
                         await self.portfolio._db.execute(
@@ -2513,7 +2516,7 @@ class OrderManager:
                     # specific tickers means unrelated account-wide volume can never hide
                     # the one order that actually matters for verifying THIS close.
                     recent_closed = await self.broker.get_closed_orders(symbols=apparent_closes)
-                    closed_tickers = {o["symbol"] for o in recent_closed if o.get("side") == "sell"}
+                    closed_tickers = {o["symbol"] for o in recent_closed if o.get("side") == "buy"}
                 except Exception as _e:
                     logger.warning("update_positions: get_closed_orders failed (%s) — skipping close-sync this cycle", _e)
                     closed_tickers = set()  # empty = treat all apparent closes as unverified, skip them
@@ -2558,7 +2561,7 @@ class OrderManager:
                             # _reconcile_untracked_fill, instead of guessing.
                             ticker_closes = [
                                 o for o in recent_closed
-                                if o.get("symbol") == ticker and o.get("side") == "sell"
+                                if o.get("symbol") == ticker and o.get("side") == "buy"
                                 and (o.get("filled_qty") or 0) > 0 and o.get("filled_at")
                             ]
                             ticker_closes.sort(key=lambda o: o["filled_at"])

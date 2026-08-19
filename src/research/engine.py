@@ -67,19 +67,20 @@ def _parse_json_bool(value, default: bool) -> bool:
 def _clamp_ai_stop_loss(
     raw_stop: float, entry_price: float, min_pct: float, max_pct: float,
 ) -> float:
-    """Bounds an AI-chosen stop-loss into [entry*(1 - max_pct/100), entry*(1 - min_pct/100)]
-    (2026-07-31, AI-chosen stop-loss/TP feature) -- a real technical level (support,
-    recent swing low) Claude identifies could still be unusually tight or wide due to a
-    bad read; this guards against a degenerate stop reaching the actual order without
-    discarding Claude's judgment for the normal case. Only applied when
-    research.ai_chosen_stop_tp_enabled is true -- the existing fixed-percentage mode
-    never calls this. entry_price <= 0 is a defensive no-op (never expected in
-    practice) -- there's no sensible bound to compute against a zero/negative price, so
-    the raw value passes through unchanged rather than raising."""
+    """Bounds an AI-chosen stop-loss into [entry*(1 + min_pct/100), entry*(1 + max_pct/100)]
+    (2026-07-31, AI-chosen stop-loss/TP feature; short economics 2026-08-19 -- the stop
+    sits ABOVE entry, so the floor/ceiling are inverted from AITrading's own long-only
+    version) -- a real technical level (resistance, recent swing high) Claude identifies
+    could still be unusually tight or wide due to a bad read; this guards against a
+    degenerate stop reaching the actual order without discarding Claude's judgment for
+    the normal case. Only applied when research.ai_chosen_stop_tp_enabled is true -- the
+    existing fixed-percentage mode never calls this. entry_price <= 0 is a defensive
+    no-op (never expected in practice) -- there's no sensible bound to compute against a
+    zero/negative price, so the raw value passes through unchanged rather than raising."""
     if entry_price <= 0:
         return raw_stop
-    floor = entry_price * (1 - max_pct / 100)
-    ceiling = entry_price * (1 - min_pct / 100)
+    floor = entry_price * (1 + min_pct / 100)
+    ceiling = entry_price * (1 + max_pct / 100)
     return max(floor, min(raw_stop, ceiling))
 
 
@@ -1090,7 +1091,8 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             data = json.loads(response_text.replace('\r\n', ' ').replace('\n', ' '))
 
         entry_price = float(data["entry_price"]) if data.get("entry_price") is not None else current_price
-        raw_stop_loss = float(data["stop_loss"]) if data.get("stop_loss") is not None else current_price * 0.95
+        # Short economics: stop sits above entry when Claude's response omits one.
+        raw_stop_loss = float(data["stop_loss"]) if data.get("stop_loss") is not None else current_price * 1.05
         research_cfg = self.config.get("research", {})
         if research_cfg.get("ai_chosen_stop_tp_enabled", False):
             stop_loss = _clamp_ai_stop_loss(
@@ -1169,7 +1171,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             recommended_action="NO ACTION — AI error",
             entry_price=current_price,
             position_size_pct=0,
-            stop_loss=current_price * 0.95,
+            stop_loss=current_price * 1.05,
             is_fallback=True,
         )
 
@@ -1757,10 +1759,11 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         t1_pct  = tp_cfg.get("t1_pct",  5.0) / 100
         t2_pct  = tp_cfg.get("t2_pct", 10.0) / 100
         t3_pct  = tp_cfg.get("t3_pct", 17.0) / 100
-        stop_loss = round(price * (1 - sl_pct), 2)
-        t1 = round(price * (1 + t1_pct), 2)
-        t2 = round(price * (1 + t2_pct), 2)
-        t3 = round(price * (1 + t3_pct), 2)
+        # Short economics: stop sits above price, take-profit targets sit below it.
+        stop_loss = round(price * (1 + sl_pct), 2)
+        t1 = round(price * (1 - t1_pct), 2)
+        t2 = round(price * (1 - t2_pct), 2)
+        t3 = round(price * (1 - t3_pct), 2)
 
         logger.warning("Rule-based fallback analysis for %s — AI unavailable, buy signals blocked", ticker)
         return ResearchReport(
