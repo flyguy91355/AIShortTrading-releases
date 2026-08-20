@@ -8086,15 +8086,33 @@ async def apply_update():
         return {"status": "already_applying",
                 "detail": "An update is already being applied — wait for it to finish."}
     state._apply_update_in_progress = True
+
+    # Logged to the AI Research Engine panel (2026-08-20, owner request after the
+    # session-cookie hang incident) -- previously the entire apply lifecycle only ever
+    # showed up in journalctl on the box itself, invisible from the dashboard, and a
+    # failure was visible only to whichever single browser tab happened to have clicked
+    # the button. `_ai_log_update` wraps add_ai_log + broadcast together (same
+    # pattern used throughout this file) so every real outcome -- success or any of the
+    # several distinct failure points below -- lands in the same persisted, restart-
+    # surviving log the rest of the system already uses.
+    async def _ai_log_update(content: str, level: str = "info") -> None:
+        entry = state.add_ai_log("SYSTEM", "UPDATE", content, level)
+        await state.broadcast({"type": "ai_log", "entry": entry})
+
     try:
         repo = state.config.get("update", {}).get("releases_repo", "")
         if not repo:
+            await _ai_log_update("Apply Update failed — update.releases_repo not configured", "error")
             return {"status": "error", "detail": "update.releases_repo not configured"}
 
         try:
             release = fetch_latest_release(repo)
         except Exception as exc:
+            await _ai_log_update(f"Apply Update failed — could not fetch latest release: {exc}", "error")
             return {"status": "error", "detail": f"could not fetch latest release: {exc}"}
+
+        target_version = release["tag_name"]
+        await _ai_log_update(f"Applying update {target_version} — downloading release...")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             archive_path = str(Path(tmp_dir) / "release.tar.gz")
@@ -8103,6 +8121,9 @@ async def apply_update():
                 response.raise_for_status()
                 Path(archive_path).write_bytes(response.content)
             except Exception as exc:
+                await _ai_log_update(
+                    f"Apply Update {target_version} failed — could not download release archive: {exc}",
+                    "error")
                 return {"status": "error", "detail": f"could not download release archive: {exc}"}
 
             try:
@@ -8110,6 +8131,9 @@ async def apply_update():
                 Path(extract_dir).mkdir()
                 extracted_root = extract_release_archive(archive_path, extract_dir)
             except Exception as exc:
+                await _ai_log_update(
+                    f"Apply Update {target_version} failed — could not extract release archive: {exc}",
+                    "error")
                 return {"status": "error", "detail": f"could not extract release archive: {exc}"}
 
             old_requirements_path = Path(_INSTALL_ROOT) / "requirements.txt"
@@ -8125,6 +8149,7 @@ async def apply_update():
             copy_updatable_files(extracted_root, _INSTALL_ROOT)
 
             if needs_pip_install:
+                await _ai_log_update(f"Applying update {target_version} — requirements.txt changed, reinstalling dependencies...")
                 pip_result = subprocess.run(
                     [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
                     cwd=_INSTALL_ROOT,
@@ -8132,12 +8157,23 @@ async def apply_update():
                     text=True,
                 )
                 if pip_result.returncode != 0:
+                    await _ai_log_update(
+                        f"Apply Update {target_version} failed — pip install failed, "
+                        f"service NOT restarted: {pip_result.stderr}", "error")
                     return {
                         "status": "error",
                         "detail": f"pip install failed, service NOT restarted: {pip_result.stderr}",
                     }
 
             write_local_version(_VERSION_FILE_PATH, release["tag_name"])
+
+        # Logged (and its fire-and-forget DB write given a moment to actually land,
+        # not just queued) BEFORE the restart thread fires -- add_ai_log persists via
+        # asyncio.create_task(asyncio.to_thread(...)), and this process is about to be
+        # killed by systemd during the restart below, so a queued-but-not-yet-run task
+        # would otherwise risk never actually reaching the DB.
+        await _ai_log_update(f"Update {target_version} applied successfully — restarting service now")
+        await asyncio.sleep(0.1)
 
         threading.Thread(target=_restart_service_after_delay, daemon=True).start()
 
