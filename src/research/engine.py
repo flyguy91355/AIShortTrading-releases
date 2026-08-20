@@ -148,7 +148,9 @@ class DeepDiveReport:
 
 
 DEEP_DIVE_PROMPT = """\
-You are a senior equity research analyst producing an institutional-grade DEEP DIVE research report. This is a full comprehensive analysis — go beyond surface metrics to deliver a definitive investment verdict.
+You are a senior equity research analyst specializing in SHORT-SELLING, producing an institutional-grade DEEP DIVE research report. This is a full comprehensive analysis — go beyond surface metrics to deliver a definitive verdict on whether this stock is worth shorting.
+
+CRITICAL — WHAT "BUY"/"STRONG BUY" MEANS HERE: this system exclusively opens SHORT positions. A "BUY"/"STRONG BUY" signal means "open a SHORT position on this stock" (borrow shares and sell them now, expecting to buy them back later at a lower price) — it does NOT mean purchase shares expecting the price to rise. "SELL"/"STRONG SELL" means avoid or close a short on this name (e.g. it looks poised to rise, squeezing a short). Look for stocks that are OVERVALUED, deteriorating, or likely to DECLINE — a cheap, undervalued, or improving stock is a poor short candidate regardless of how attractive it would be to a long-only buyer.
 
 TODAY'S DATE: {current_date} — every catalyst timeframe or referenced event must be realistic relative to this date. Never reference a quarter, month, or year that has already passed.
 
@@ -174,32 +176,32 @@ INITIAL SCREEN FAIR VALUE ESTIMATE: ${prior_fair_value:.2f} (margin of safety {p
 
 Perform a COMPREHENSIVE deep-dive. Evaluate ALL of the following dimensions:
 
-1. SIGNAL & CONVICTION — your final verdict (STRONG BUY / BUY / HOLD / SELL / STRONG SELL) and why
-2. INVESTMENT THESIS — the core 2-3 sentence case for or against this stock
-3. VALUATION — DCF-style intrinsic value reasoning; is the stock cheap, fair, or expensive?
+1. SIGNAL & CONVICTION — your final verdict (STRONG BUY / BUY / HOLD / SELL / STRONG SELL, i.e. how strongly you'd short this) and why
+2. SHORT THESIS — the core 2-3 sentence case for or against shorting this stock
+3. VALUATION — DCF-style intrinsic value reasoning; is the stock cheap, fair, or expensive? (expensive = supports a short)
 4. TECHNICAL ANALYSIS — trend direction, momentum, key support/resistance levels, volume patterns
-5. COMPETITIVE MOAT — pricing power, switching costs, market share, barriers to entry
-6. GROWTH OUTLOOK — revenue/earnings growth trajectory, margin expansion or compression
-7. CATALYSTS — specific upcoming events that could move the stock
-8. RISK SCENARIOS — bull, base, bear cases with price targets and probabilities
-9. RISK FACTORS — what could invalidate the thesis
-10. ENTRY & STOP — optimal entry zone, stop loss level
+5. COMPETITIVE MOAT — pricing power, switching costs, market share, barriers to entry (a NARROW or absent moat supports a short — a wide moat protects fundamentals and argues against one)
+6. GROWTH OUTLOOK — revenue/earnings growth trajectory, margin expansion or compression (deceleration or compression supports a short)
+7. CATALYSTS — specific upcoming events that could move the stock DOWN (support the short) or UP (squeeze risk)
+8. RISK SCENARIOS — bull, base, bear cases with price targets and probabilities (bear = the short thesis playing out)
+9. RISK FACTORS — what could invalidate the short thesis, e.g. what could make the price rise and squeeze the short
+10. ENTRY & STOP — optimal short entry zone, stop loss level (the stop sits ABOVE entry — the level at which a rising price would force covering at a loss)
 11. MONITORING — key metrics and events to watch weekly
 
 Respond as JSON with these exact fields:
 {{
     "signal": "<STRONG BUY|BUY|HOLD|SELL|STRONG SELL>",
     "conviction_score": <1-10, one decimal place, e.g. 7.3>,
-    "thesis": "<2-3 sentence investment thesis — the core reason to buy or avoid>",
+    "thesis": "<2-3 sentence case for (or against) shorting this stock>",
     "valuation_analysis": "<detailed DCF-style valuation reasoning>",
     "fair_value_estimate": <intrinsic value estimate as a number>,
-    "margin_of_safety_pct": <percentage below fair value the current price represents — negative if overvalued>,
-    "entry_price": <recommended entry price>,
-    "stop_loss": <stop loss price — typically 5-8% below entry>,
+    "margin_of_safety_pct": <percentage the CURRENT PRICE sits ABOVE fair value — how overvalued this looks, i.e. how much downside a short has if price reverts to fair value; negative if the stock still looks UNDERVALUED (a poor short candidate)>,
+    "entry_price": <recommended price to sell short at>,
+    "stop_loss": <stop loss price — typically 5-8% above entry>,
     "technical_analysis": "<trend, momentum, support/resistance, volume — 2-3 sentences>",
     "competitive_moat": "<moat quality: wide/narrow/none and why — pricing power, switching costs, market share>",
     "growth_outlook": "<revenue and earnings growth trajectory, margin trends — 2-3 sentences>",
-    "risk_factors": "<key risks that could invalidate the thesis>",
+    "risk_factors": "<key risks that could invalidate the short thesis>",
     "catalysts": [
         {{"event": "<specific catalyst>", "timeframe": "<when>", "impact": "<expected price impact>"}}
     ],
@@ -208,18 +210,18 @@ Respond as JSON with these exact fields:
         {{"scenario": "Base", "probability_pct": <number>, "price_target": <number>, "description": "<what drives this outcome>"}},
         {{"scenario": "Bear", "probability_pct": <number>, "price_target": <number>, "description": "<what drives this outcome>"}}
     ],
-    "entry_zone_low": <optimal buy zone low price>,
-    "entry_zone_high": <optimal buy zone high price>,
+    "entry_zone_low": <optimal short entry zone low price>,
+    "entry_zone_high": <optimal short entry zone high price>,
     "monitoring_checklist": ["<specific metric or event to track weekly — be concrete>"],
-    "enhanced_reasoning": "<comprehensive narrative connecting all dimensions — valuation, technicals, moat, catalysts, risks — into a unified investment view>"
+    "enhanced_reasoning": "<comprehensive narrative connecting all dimensions — valuation, technicals, moat, catalysts, risks — into a unified short-thesis view>"
 }}
 
 Rules:
-- STRONG BUY requires conviction >= 8, clear moat, MOS >= 20%
-- BUY requires conviction >= 7, positive technicals, MOS >= 10%
-- HOLD if thesis is intact but entry is stretched or risk/reward is borderline
-- SELL if fundamentals deteriorating or price at/above fair value with no catalyst
-- STRONG SELL if significant downside risk, broken thesis, or structural headwinds
+- STRONG BUY (highest-conviction short) requires conviction >= 8, narrow/no moat, MOS >= 20% (i.e. overvalued by 20%+)
+- BUY (a real short) requires conviction >= 7, confirmed downtrend, MOS >= 10%
+- HOLD if the short thesis has merit but entry is stretched or risk/reward is borderline
+- SELL (avoid/close a short) if fundamentals are improving or price is at/below fair value with no bearish catalyst
+- STRONG SELL (definitely avoid/close) if significant upside/squeeze risk, a broken short thesis, or structural tailwinds
 - probability_pct across all three scenarios must sum to 100
 - Every numeric field you output (stop_loss, entry_price, entry_zone_low, entry_zone_high) must be used consistently everywhere else in your response, including inside enhanced_reasoning — never state a different number in your narrative than what you output in these fields.
 - fair_value_estimate must be the actual output of the valuation methodology you describe in valuation_analysis — never state one intrinsic value range or figure in valuation_analysis and then output a different number in the fair_value_estimate field.
@@ -229,7 +231,9 @@ Respond with ONLY the JSON object, no other text.
 
 
 DEEPER_DIVE_PROMPT = """\
-You are a senior equity research analyst producing an institutional-grade DEEPER DIVE — the most comprehensive analysis possible on a single stock. You have already completed a standard deep dive. Now go significantly further.
+You are a senior equity research analyst specializing in SHORT-SELLING, producing an institutional-grade DEEPER DIVE — the most comprehensive analysis possible on a single stock's case for (or against) shorting. You have already completed a standard deep dive. Now go significantly further.
+
+Reminder — this system exclusively opens SHORT positions: "BUY"/"STRONG BUY" means recommend shorting, "SELL"/"STRONG SELL" means avoid or close a short.
 
 STOCK: {ticker} — {company_name}
 CURRENT PRICE: ${current_price:.2f}
@@ -263,37 +267,37 @@ Analysis: {prior_reasoning}
 
 This is the DEEPEST possible analysis. Go well beyond the prior deep dive. Evaluate ALL dimensions below with maximum rigor and specificity:
 
-1. REVISED SIGNAL & CONVICTION — does the deeper analysis confirm, strengthen, or change the prior verdict?
-2. PEER COMPARISON — name 3-5 specific direct competitors; compare this stock's valuation (P/E, EV/EBITDA, P/S), growth rate, margins, and moat quality against each. Where does it rank?
-3. MANAGEMENT QUALITY — track record of capital allocation (buybacks, dividends, acquisitions, debt management); insider buying/selling patterns; CEO tenure and credibility; any red flags in guidance history
-4. MACRO SENSITIVITY — specific exposure to: interest rates, USD strength, commodity prices, consumer credit cycles, regulatory environment, geopolitical risk. What macro environment is ideal vs. dangerous for this stock?
-5. HISTORICAL PATTERNS — how has this stock behaved in past bear markets, recessions, sector rotations? Does it tend to lead or lag the market? Seasonal patterns?
-6. PROBABILITY-WEIGHTED RETURNS — given all three scenarios (bull/base/bear) with their probabilities, what is the expected return over 6 months and 12 months?
+1. REVISED SIGNAL & CONVICTION — does the deeper analysis confirm, strengthen, or change the prior short verdict?
+2. PEER COMPARISON — name 3-5 specific direct competitors; compare this stock's valuation (P/E, EV/EBITDA, P/S), growth rate, margins, and moat quality against each. Is it the most overvalued/vulnerable of the group, or does the short case look weaker relative to peers?
+3. MANAGEMENT QUALITY — track record of capital allocation (buybacks, dividends, acquisitions, debt management); insider buying/selling patterns (heavy insider SELLING supports a short); CEO tenure and credibility; any red flags in guidance history
+4. MACRO SENSITIVITY — specific exposure to: interest rates, USD strength, commodity prices, consumer credit cycles, regulatory environment, geopolitical risk. What macro environment would help this short thesis play out vs. squeeze it?
+5. HISTORICAL PATTERNS — how has this stock behaved in past bear markets, recessions, sector rotations? Does it tend to lead or lag the market on the way down? Seasonal patterns?
+6. PROBABILITY-WEIGHTED RETURNS — given all three scenarios (bull/base/bear) with their probabilities, what is the expected return on a SHORT position over 6 months and 12 months? (a bear-case price decline is a positive return for the short)
 7. REVISED CATALYSTS — any new or refined catalysts beyond the prior analysis
 8. REVISED RISK SCENARIOS — refine bull/base/bear with more specific price targets and drivers
-9. POSITION SIZING — specific recommendation for position size % and why (account for volatility, liquidity, correlation with typical holdings)
+9. POSITION SIZING — specific recommendation for position size % and why (account for volatility, liquidity, borrow cost/availability, correlation with typical holdings)
 10. FINAL COMPREHENSIVE VERDICT — a 4-6 sentence synthesis that a portfolio manager could read and act on
 
 Respond as JSON with ALL these exact fields:
 {{
     "signal": "<STRONG BUY|BUY|HOLD|SELL|STRONG SELL>",
     "conviction_score": <1-10, one decimal place, e.g. 7.3>,
-    "thesis": "<3-4 sentence revised investment thesis incorporating all findings>",
+    "thesis": "<3-4 sentence revised short thesis incorporating all findings>",
     "valuation_analysis": "<refined DCF-style valuation — more specific than prior dive>",
     "fair_value_estimate": <refined intrinsic value as a number>,
-    "margin_of_safety_pct": <percentage below fair value — negative if overvalued>,
-    "entry_price": <recommended entry price>,
-    "stop_loss": <stop loss price>,
+    "margin_of_safety_pct": <percentage the CURRENT PRICE sits ABOVE fair value — negative if still UNDERVALUED>,
+    "entry_price": <recommended price to sell short at>,
+    "stop_loss": <stop loss price, above entry>,
     "technical_analysis": "<refined technical analysis with specific price levels>",
     "competitive_moat": "<refined moat assessment with peer context>",
     "growth_outlook": "<refined growth trajectory with specific numbers where possible>",
-    "risk_factors": "<comprehensive list of risks — more specific than prior dive>",
-    "peer_comparison": "<name each peer, compare valuation/growth/moat, conclude where this stock ranks>",
+    "risk_factors": "<comprehensive list of risks that could invalidate the short — more specific than prior dive>",
+    "peer_comparison": "<name each peer, compare valuation/growth/moat, conclude where this stock ranks as a short candidate>",
     "management_quality": "<capital allocation track record, insider activity, CEO credibility, red flags>",
-    "macro_sensitivity": "<specific macro exposures and what environment helps vs. hurts>",
+    "macro_sensitivity": "<specific macro exposures and what environment helps vs. hurts the short thesis>",
     "historical_patterns": "<bear market behavior, recession performance, seasonality, market leadership>",
-    "expected_return_6m": <probability-weighted expected return over 6 months as a percentage>,
-    "expected_return_12m": <probability-weighted expected return over 12 months as a percentage>,
+    "expected_return_6m": <probability-weighted expected return ON THE SHORT POSITION over 6 months, as a percentage>,
+    "expected_return_12m": <probability-weighted expected return ON THE SHORT POSITION over 12 months, as a percentage>,
     "catalysts": [
         {{"event": "<specific catalyst>", "timeframe": "<when>", "impact": "<expected price impact>"}}
     ],
@@ -302,8 +306,8 @@ Respond as JSON with ALL these exact fields:
         {{"scenario": "Base", "probability_pct": <number>, "price_target": <number>, "description": "<specific drivers>"}},
         {{"scenario": "Bear", "probability_pct": <number>, "price_target": <number>, "description": "<specific drivers>"}}
     ],
-    "entry_zone_low": <optimal buy zone low>,
-    "entry_zone_high": <optimal buy zone high>,
+    "entry_zone_low": <optimal short entry zone low>,
+    "entry_zone_high": <optimal short entry zone high>,
     "monitoring_checklist": ["<specific, concrete metric or event to track — not generic>"],
     "enhanced_reasoning": "<4-6 sentence final verdict that synthesizes ALL dimensions — suitable for a portfolio manager to act on>"
 }}
@@ -311,7 +315,7 @@ Respond as JSON with ALL these exact fields:
 Rules:
 - Be more specific than the prior dive — use actual numbers, name actual competitors, name actual macro factors
 - probability_pct across scenarios must sum to 100
-- expected_return_6m and expected_return_12m must be probability-weighted (multiply each scenario's return by its probability)
+- expected_return_6m and expected_return_12m are the SHORT position's own expected return (probability-weighted; a bear-case decline is a gain for the short)
 - If the deeper analysis changes the signal or conviction from the prior dive, explain why
 
 Respond with ONLY the JSON object, no other text.
@@ -896,6 +900,14 @@ reading it, not a generic one-liner>"}}
         prompt = f"""Assess the overall health of this stock trading portfolio and
 predict its likely annualized return. Be direct and specific — flag real risks and
 real strengths, don't hedge everything into meaninglessness.
+
+IMPORTANT — THIS IS A SHORT-ONLY SYSTEM: every position below is a SHORT SALE, not a
+long buy — the system profits when a position's price FALLS, not rises. Each position's
+"margin of safety %" means how far the current price sits ABOVE fair value (positive =
+overvalued = a good short setup; negative = still undervalued = a weak one) — the
+opposite convention from a long-only fund. unrealized/day/total P&L figures are already
+computed with short economics (a positive number is a real gain), so read them at face
+value.
 
 IMPORTANT CONTEXT: This automated trading system has been under active development and
 has undergone major rewrites to its buy/sell decision logic recently — most significantly
