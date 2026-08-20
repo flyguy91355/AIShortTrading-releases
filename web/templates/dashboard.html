@@ -1478,10 +1478,13 @@ function updateTickerSignal(badge) {
   const sigEl = btn.querySelector('.btn-sig-code');
   if (!sigEl) return;
 
-  // Map signal string → display label + CSS class
+  // Map signal string → display label + CSS class. Internal signal values stay
+  // BUY/STRONG BUY (Signal enum reused unchanged from AITrading — see CLAUDE.md) even
+  // though this system only ever opens shorts; only the DISPLAYED label is renamed so
+  // the AI's real recommendation ("short this") doesn't read as "buy this" on screen.
   let shortCode, cssClass, btnClass;
-  if (sig === 'STRONG BUY')       { shortCode = 'Strong Buy';  cssClass = 'sig-sbuy';  btnClass = 'has-sbuy'; }
-  else if (sig === 'BUY')         { shortCode = 'Buy';         cssClass = 'sig-buy';   btnClass = 'has-buy'; }
+  if (sig === 'STRONG BUY')       { shortCode = 'Strong Short'; cssClass = 'sig-sbuy';  btnClass = 'has-sbuy'; }
+  else if (sig === 'BUY')         { shortCode = 'Short';        cssClass = 'sig-buy';   btnClass = 'has-buy'; }
   else if (sig === 'HOLD')        { shortCode = 'Hold';        cssClass = 'sig-hold';  btnClass = 'has-hold'; }
   else if (sig === 'SELL')        { shortCode = 'Sell';        cssClass = 'sig-sell';  btnClass = 'has-sell'; }
   else if (sig === 'STRONG SELL') { shortCode = 'Strong Sell'; cssClass = 'sig-ssell'; btnClass = 'has-ssell'; }
@@ -2378,8 +2381,13 @@ function renderPositions(positions) {
     const stopCell = stopColor
       ? `<span style="color:${stopColor}">${stopValueStr}</span>`
       : stopValueStr;
-    const dirArrow = p.price_direction === 'up' ? '<span class="positive">▲</span> '
-                    : p.price_direction === 'down' ? '<span class="negative">▼</span> '
+    // Short position: price rising is against the position (loss), price falling is in
+    // favor of it (gain) -- inverted from AITrading's own long-side coloring, where a
+    // rising price is the positive direction. price_direction itself is still a raw
+    // price comparison (current > old -> "up") computed in web/app.py -- only which
+    // color that maps to is flipped here.
+    const dirArrow = p.price_direction === 'up' ? '<span class="negative">▲</span> '
+                    : p.price_direction === 'down' ? '<span class="positive">▼</span> '
                     : '';
     // Positions always start with 3 staged TP targets (33/33/34 split); the remaining
     // count tells us how many already fired. T3 itself is never a real order (final
@@ -3290,11 +3298,15 @@ function renderNearMissGrid(data) {
     // definition. Plain inline colors instead.
     const rrColor = _rrInQualifyingRange(nm.rr, requiredRR) ? 'var(--green)' : 'var(--text-primary)';
     const convColor = (nm.conviction_score || 0) >= _MIN_CONVICTION_GATE ? 'var(--green)' : 'var(--text-primary)';
-    const dirArrow = nm.direction === 'up' ? '<span class="positive">▲</span> '
-                    : nm.direction === 'down' ? '<span class="negative">▼</span> '
+    // Short candidate: a downtick is the favorable direction (confirms the rally
+    // rolling over toward a short entry), an uptick is unfavorable -- inverted from
+    // AITrading's own long-side coloring. See the equivalent position-table fix above
+    // for the same inversion applied to an open position's live P&L direction.
+    const dirArrow = nm.direction === 'up' ? '<span class="negative">▲</span> '
+                    : nm.direction === 'down' ? '<span class="positive">▼</span> '
                     : '';
     const streakStr = (nm.streak || 0) >= 2
-      ? ` <span style="color:${nm.direction === 'up' ? 'var(--green)' : 'var(--red)'};font-size:10px;">×${nm.streak}</span>`
+      ? ` <span style="color:${nm.direction === 'up' ? 'var(--red)' : 'var(--green)'};font-size:10px;">×${nm.streak}</span>`
       : '';
     // Badge only shows once R/R has actually risen to/above its own gate (2026-08-12,
     // owner: "its not really a buy at that point... invisiable until the stock climbs

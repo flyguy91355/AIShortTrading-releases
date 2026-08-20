@@ -4758,31 +4758,35 @@ class DashboardState:
         away from fair_value is the intended, correct behavior (more margin of safety),
         not a bug.
 
-        Promotes on R/R clearing the gate AND a confirmed entry-price recovery, using one of
-        two research.on_deck_entry_mode strategies (2026-07-18):
+        Promotes on R/R clearing the gate AND a confirmed entry-price rollover, using one of
+        two research.on_deck_entry_mode strategies (ported from AITrading 2026-08-19, mirrored
+        for short mechanics — this system watches for a RALLY that rolls over, not a dip that
+        recovers; dip_summary's peak/low still mean exactly what they say, just peak is now the
+        primary anchor):
 
-        - "retracement": current price has recovered at least research.on_deck_retracement_pct
-          (default 20%) of the dip's own depth, measured from the previous peak (the highest
-          price in the window before the low) down to the low. Replaced an earlier flat
-          %-off-the-low check per the user's own reasoning: a flat percent asks the same
-          absolute bounce regardless of how far a stock actually fell, so a deep,
-          still-crashing stock could clear it on a trivial bounce while a shallow dip needed a
-          comparatively large one. Measuring the bounce as a % of the dip itself scales
-          naturally to each stock's own move (same idea as a technical-analysis retracement
-          level, e.g. Fibonacci retracements).
-        - "ai": once a real dip has started recovering (2+ consecutive upticks off the low),
-          fires a ONE-TIME Claude call (research_engine.recommend_dip_entry, via
+        - "retracement": current price has fallen back at least research.on_deck_retracement_pct
+          (default 20%) of the rally's own depth, measured from the low (the lowest price in
+          the window before the peak) up to the peak. Mirrors AITrading's own reasoning for the
+          long side: a flat percent asks the same absolute pullback regardless of how far a
+          stock actually rallied, so a big, still-running rally could clear it on a trivial
+          pullback while a shallow rally needed a comparatively large one. Measuring the
+          pullback as a % of the rally itself scales naturally to each stock's own move (same
+          idea as a technical-analysis retracement level, e.g. Fibonacci retracements).
+        - "ai": once a real rally has started rolling over (2+ consecutive downticks off the
+          peak), fires a ONE-TIME Claude call (research_engine.recommend_dip_entry, via
           _compute_ai_dip_entry) with the actual observed peak/low/current price and asks for
-          a specific recommended entry price, then promotes once price reaches that level.
-          Per the user's own reasoning: Claude can't meaningfully predict a pullback entry
-          before the dip has happened — a recommendation is only informed once there's a real
-          peak, low, and recovery already visible. The result is cached against the low it was
-          computed from (ai_entry_low_ref) and invalidated (recomputed on the next qualifying
-          uptick) if a new, deeper low forms afterward, making the old number stale.
+          a specific recommended short-entry price, then promotes once price falls to that
+          level. Claude can't meaningfully predict a pullback entry before the rally has
+          rolled over — a recommendation is only informed once there's a real peak, low, and
+          rollover already visible. The result is cached against the peak it was computed from
+          (ai_entry_low_ref — field name kept unchanged from the AITrading fork despite tracking
+          a peak now, not a low; internal identifier only, never displayed) and invalidated
+          (recomputed on the next qualifying downtick) if a new, higher peak forms afterward,
+          making the old number stale.
 
         Both modes share the same underlying peak/low/depth math (src.research.rr_curve.
         dip_summary) — "retracement" uses its retracement_target directly; "ai" only uses it
-        to find peak/low/depth to hand to Claude and to detect when the low has moved (staling
+        to find peak/low/depth to hand to Claude and to detect when the peak has moved (staling
         the cached recommendation).
 
         price_history persists across pre-open re-vets and restarts (changed 2026-07-18, was
@@ -4882,13 +4886,14 @@ class DashboardState:
                         nm["streak"] = (nm.get("streak", 0) + 1
                                          if new_direction == nm.get("direction") else 1)
                         nm["direction"] = new_direction
-                        # Rolling window of recent tick directions (2026-07-21) — backs the
-                        # no-dip up-tick-count trigger below, a second, independent measure
-                        # from the streak above: "how many of the last N changes were up"
-                        # rather than "how many in a row right now." A single down-tick barely
-                        # moves this count the way it fully resets the streak, so it catches a
-                        # steady, low-volatility grind that never produces a long same-direction
-                        # streak or a large % price move, without needing either of those.
+                        # Rolling window of recent tick directions (mirrors AITrading's own
+                        # 2026-07-21 design) — backs the no-rally down-tick-count trigger below,
+                        # a second, independent measure from the streak above: "how many of the
+                        # last N changes were down" rather than "how many in a row right now." A
+                        # single up-tick barely moves this count the way it fully resets the
+                        # streak, so it catches a steady, low-volatility grind down that never
+                        # produces a long same-direction streak or a large % price move, without
+                        # needing either of those.
                         up_ratio_window = self.config["research"].get("on_deck_up_ratio_window", 10)
                         recent = nm.setdefault("recent_directions", [])
                         recent.append(new_direction)
@@ -5204,7 +5209,7 @@ class DashboardState:
                     self._mark_universe_reject(ticker)
                     entry = self.add_ai_log(ticker, "ON_DECK",
                         f"Removed from On Deck — R/R {rr_val:.2f} above its own gate "
-                        f"({required_rr:.2f}), AI judged it's no longer a good buy: "
+                        f"({required_rr:.2f}), AI judged it's no longer a good short: "
                         f"{reasoning}", "warning")
                     asyncio.create_task(self.broadcast({"type": "ai_log", "entry": entry}))
                 if to_evict_above_gate:
@@ -5411,19 +5416,22 @@ class DashboardState:
         governs whether a genuinely weak stock eventually leaves the list, via the next
         persist-check.
 
-        `dip_low` — the low-to-peak rally's peak price that triggered THIS attempt, or None if
-        this attempt came from the no-dip sustained-uptrend trigger instead (2026-07-21 — see
-        near_miss_monitor_loop). On failure, a real dip_low is stored as
-        nm["promotion_failed_low"] so near_miss_monitor_loop won't re-trigger another attempt
-        for the same dip (the trigger condition is price-based and has nothing to do with why
-        a promotion actually fails — conviction, signal, R/R — so retrying purely because
-        price is still elevated would just re-run the same check against an unchanged
-        real-world situation, indefinitely). Becomes eligible again the moment either a
-        genuinely new, deeper low forms, or the next persist-check refreshes conviction and
-        resets the AI-entry state anyway. A None dip_low means this attempt came from one of
-        the two no-dip triggers instead (see near_miss_monitor_loop) — on failure, both
-        nm["no_dip_failed_at_pct_gain"] and nm["no_dip_failed_at_up_count"] are refreshed to
-        their current values, same idea as promotion_failed_low but keyed on either measure
+        `dip_low` — the rolling-over rally's PEAK price that triggered THIS attempt (the
+        parameter name is kept unchanged from the AITrading fork even though it now holds a
+        peak, not a low — internal identifier only, never displayed; see CLAUDE.md), or None
+        if this attempt came from the no-rally sustained-downtrend trigger instead (mirrors
+        AITrading's own 2026-07-21 design — see near_miss_monitor_loop). On failure, the real
+        peak is stored as nm["promotion_failed_low"] (same legacy field-name situation) so
+        near_miss_monitor_loop won't re-trigger another attempt for the same rally (the trigger
+        condition is price-based and has nothing to do with why a promotion actually fails —
+        conviction, signal, R/R — so retrying purely because price is still depressed would
+        just re-run the same check against an unchanged real-world situation, indefinitely).
+        Becomes eligible again the moment either a genuinely new, higher peak forms, or the
+        next persist-check refreshes conviction and resets the AI-entry state anyway. A None
+        dip_low means this attempt came from one of the two no-rally triggers instead (see
+        near_miss_monitor_loop) — on failure, both nm["no_dip_failed_at_pct_gain"] and
+        nm["no_dip_failed_at_up_count"] are refreshed to their current values, same idea as
+        promotion_failed_low but keyed on either measure
         growing further past that point rather than a new low forming."""
         if ticker in self.portfolio.positions:
             return
@@ -5442,7 +5450,7 @@ class DashboardState:
             _ch, _cm = _cutoff_str.split(":")
             if self._now_et().time() >= dtime(int(_ch), int(_cm)):
                 entry = self.add_ai_log(ticker, "ON_DECK",
-                    f"R/R + uptick confirmed but past {_cutoff_str} ET cutoff — skipping", "warning")
+                    f"R/R + rollover confirmed but past {_cutoff_str} ET cutoff — skipping", "warning")
                 await self.broadcast({"type": "ai_log", "entry": entry})
                 self._record_promotion_attempt(ticker, dip_low, f"Past {_cutoff_str} ET cutoff")
                 return
@@ -6368,9 +6376,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         first time it was ever looked at.
 
         R/R above the gate is ambiguous on its own -- it can mean genuine
-        undervaluation, or it can simply mean price kept falling toward the stop
-        (or, per the OXY incident, a fresh re-analysis simply plants a tight stop
-        right under a recent low), which mechanically inflates the ratio without
+        overvaluation, or it can simply mean price kept rising toward the stop
+        (mirrors AITrading's own OXY incident, direction-flipped: a fresh
+        re-analysis simply plants a tight stop right above a recent high),
+        which mechanically inflates the ratio without
         the setup improving. Owner explicitly rejected a hardcoded numeric ceiling
         for "how far above is too far" ("i dont know when it would not be a good
         buy.. maybe something for ai to choose"), so this asks Claude directly,
@@ -6588,7 +6597,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                         self._now_et() + timedelta(minutes=above_gate_cooldown_min))
                     entry = self.add_ai_log(ticker, "ON_DECK",
                         f"On Shore backfill candidate above its own gate — AI judged it's "
-                        f"no longer a good buy: {reasoning}", "warning")
+                        f"no longer a good short: {reasoning}", "warning")
                     await self.broadcast({"type": "ai_log", "entry": entry})
                     return False
 
@@ -6945,13 +6954,15 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             # pop/mark_universe_reject/removed/log/return pattern.
             #
             # Above-gate retention judged by a real Claude call, not a fixed timer
-            # (2026-08-05, owner design -- a grace-period timer was built and deployed
-            # earlier the same evening, then explicitly replaced: "i dont like the
+            # (mirrors AITrading's own 2026-08-05 design -- a grace-period timer was
+            # built and deployed there earlier the same evening, then explicitly
+            # replaced per the owner's own words on that system: "i dont like the
             # timer.. lets do this instead... whenever it isnt a good buy any
-            # more.. then evict it."). R/R exceeding a candidate's own gate is
-            # ambiguous on its own -- it can mean genuine undervaluation, or it can
-            # simply mean price kept falling toward the stop, which mechanically
-            # inflates the ratio without the setup actually improving. The SAME
+            # more.. then evict it." -- same idea applies here to a good short). R/R
+            # exceeding a candidate's own gate is ambiguous on its own -- it can mean
+            # genuine overvaluation, or it can simply mean price kept rising toward
+            # the stop, which mechanically inflates the ratio without the setup
+            # actually improving. The SAME
             # shared judgment (_on_deck_ai_gate_above_gate) is also used by
             # _backfill_on_deck_from_on_shore specifically (not the other 3
             # admission call sites, which mechanically exclude above-gate
@@ -6986,7 +6997,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     removed += 1
                     await _log(ticker,
                         f"Removed from On Deck — R/R {rr_val:.2f} above its own gate "
-                        f"({required_rr:.2f}), AI judged it's no longer a good buy: "
+                        f"({required_rr:.2f}), AI judged it's no longer a good short: "
                         f"{reasoning}", "warning")
                     return
                 if reasoning:
