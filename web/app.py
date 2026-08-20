@@ -263,6 +263,15 @@ app.add_middleware(
     secret_key=_SESSION_SECRET_KEY,
     https_only=bool(os.environ.get("SSL_CERTFILE") and os.environ.get("SSL_KEYFILE")),
     max_age=30 * 24 * 60 * 60,  # 30 days -- a personal, trusted-tailnet-only dashboard
+    # Distinct cookie name (2026-08-20, owner report) -- this app shares its physical
+    # box AND Tailscale hostname with AICryptoTrading (only the port differs: 8081 vs
+    # 8082), and cookies are not scoped by port. Both apps previously used Starlette's
+    # default cookie name ("session"), so logging into one silently overwrote the
+    # other's session cookie with a value signed by a DIFFERENT secret key -- the
+    # other app couldn't decode it, forced a re-login, and that re-login overwrote the
+    # cookie again, breaking the first app right back. Renamed so the two can never
+    # collide again, regardless of what else ever ends up sharing this box.
+    session_cookie="aishort_session",
 )
 
 INTER_STOCK_DELAY = 3
@@ -701,6 +710,38 @@ def _on_deck_rr_above_gate(rr: float, required_rr: float) -> bool:
     such track record (owner: "ai is for a stock that has risen up past the gate,"
     not one simply discovered already above it)."""
     return rr > required_rr
+
+
+def _on_deck_rr_ceiling_exceeded(rr: float, required_rr: float, ceiling_margin: float) -> bool:
+    """True if rr exceeds required_rr by more than ceiling_margin -- a small tolerance
+    band a first-look candidate (no track record) is mechanically admitted within,
+    just above its own real gate, before the harder mechanical exclude kicks in.
+    Ported from AITrading (2026-08-20, owner request -- "would it work?" / "yes"),
+    where it was built the same day to fix a real gap: a candidate landing just barely
+    over its own gate (e.g. required 2.04, actual 2.08) got hard-excluded on the raw
+    _on_deck_rr_above_gate check below purely from noise, even though it's probably a
+    good pick. A per-candidate RELATIVE margin (matching how the floor margin below
+    already works), not a flat absolute number -- AITrading's own history shows a flat
+    ceiling was tried and removed once already (2026-08-05) for comparing every
+    candidate against one shared number regardless of its own conviction-scaled gate.
+    Owner-set default 0.15, calibrated on AITrading's real rejection data the same day
+    this was built there (only 2 of 20 above-gate first-look rejections were within
+    0.10 of their own gate; the rest were 15-120% over) -- the same short-selling R/R
+    math (entry falling to fair value = reward, stop above entry = risk) makes the
+    identical "stop got dragged tight as price kept rising toward it, mechanically
+    inflating the ratio" ambiguity apply here too, just mirrored in direction, so the
+    same small tolerance and the same exclusion of genuinely large overshoots both
+    carry over unchanged.
+
+    Used ONLY at the 3 mechanical-exclude admission sites _on_deck_rr_above_gate's own
+    docstring names (the fresh universe-scan result, the startup cache restore, the
+    on-demand Settings-triggered refill) -- replaces a bare _on_deck_rr_above_gate
+    check as the reject condition at exactly those 3 sites. The AI-judgment sites
+    (persist-check retention, On-Shore backfill, the buy trigger, the continuous
+    above-gate recheck) are deliberately untouched -- those already ask a real,
+    per-candidate judgment call instead of applying a blunt numeric line, so a small
+    tolerance band adds nothing there."""
+    return rr > required_rr + ceiling_margin
 
 
 def _on_deck_composite_score(
@@ -4538,6 +4579,7 @@ class DashboardState:
         min_conviction = self.config["research"]["min_conviction_score"]
         base_rr = self.config["research"]["min_risk_reward_ratio"]
         floor_margin = self.config["research"].get("on_deck_rr_floor_margin")
+        ceiling_margin = self.config["research"].get("on_deck_rr_ceiling_margin", 0.15)
         rr_step = self.config["research"].get("on_deck_rr_conviction_step", 0.1)
         rr_floor = self.config["research"].get("on_deck_rr_floor", 1.5)
         # Same population floor as the live Phase 2 fill (_run_pre_open_batch) — a candidate
@@ -4573,12 +4615,15 @@ class DashboardState:
             required_rr = _required_rr(conviction, min_conviction, base_rr, rr_step, rr_floor)
             if _on_deck_rr_floor_not_met(rr, required_rr, floor_margin):
                 continue
-            if _on_deck_rr_above_gate(rr, required_rr):
-                # Above its own gate on a first look -- mechanical exclude, no AI call
-                # (2026-08-05, owner design). The AI-judgment exception is reserved for
+            if _on_deck_rr_ceiling_exceeded(rr, required_rr, ceiling_margin):
+                # Above its own gate by more than the small tolerance margin -- mechanical
+                # exclude, no AI call (2026-08-05, owner design; ceiling margin ported
+                # from AITrading 2026-08-20). The AI-judgment exception is reserved for
                 # a candidate that was actually watched rising past its own gate while
                 # tracked (the On-Shore backfill path specifically) -- this restore path
                 # has no such track record for any given ticker, so it gets no exception.
+                # A candidate only just above its own gate (within ceiling_margin) is
+                # still admitted here -- see _on_deck_rr_ceiling_exceeded's docstring.
                 continue
             entry = {
                 "ticker": ticker,
@@ -6717,6 +6762,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         rr_step = self.config["research"].get("on_deck_rr_conviction_step", 0.1)
         rr_floor = self.config["research"].get("on_deck_rr_floor", 1.5)
         floor_margin = self.config["research"].get("on_deck_rr_floor_margin")
+        ceiling_margin = self.config["research"].get("on_deck_rr_ceiling_margin", 0.15)
 
         def _required_rr_for(r: dict) -> float:
             return _required_rr(r.get("conviction_score", 0), min_conviction, base_rr, rr_step, rr_floor)
@@ -6734,13 +6780,15 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             stop_pct = _short_derive_stop_pct(raw.get("entry_price", 0.0), stop_loss, default_stop_pct)
             required_rr = _required_rr_for(r)
             rr_val = r.get("rr", 0.0)
-            if _on_deck_rr_above_gate(rr_val, required_rr):
-                # Above its own gate -- mechanical exclude, no AI call (2026-08-05,
-                # owner design). This rare, on-demand refill deliberately reuses
-                # today's frozen cached data without a fresh Claude call (see this
-                # function's own docstring) -- the AI-judgment exception is reserved
-                # for the continuous On-Shore backfill path specifically, which is
-                # the one actually watching a candidate's R/R move over time.
+            if _on_deck_rr_ceiling_exceeded(rr_val, required_rr, ceiling_margin):
+                # Above its own gate by more than the small tolerance margin --
+                # mechanical exclude, no AI call (2026-08-05, owner design; ceiling
+                # margin ported from AITrading 2026-08-20). This rare, on-demand
+                # refill deliberately reuses today's frozen cached data without a
+                # fresh Claude call (see this function's own docstring) -- the
+                # AI-judgment exception is reserved for the continuous On-Shore
+                # backfill path specifically, which is the one actually watching a
+                # candidate's R/R move over time.
                 continue
             entry = {
                 "ticker": ticker,
@@ -7089,15 +7137,20 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             await self.broadcast({"type": "ai_log", "entry": entry})
             return False
 
-        if _on_deck_rr_above_gate(rr_val, required_rr):
-            # Above its own gate on a first look -- mechanical exclude, no AI call
-            # (2026-08-05, owner design). Shared by both the pre-open batch and the
+        ceiling_margin = self.config["research"].get("on_deck_rr_ceiling_margin", 0.15)
+        if _on_deck_rr_ceiling_exceeded(rr_val, required_rr, ceiling_margin):
+            # Above its own gate by more than the small tolerance margin -- mechanical
+            # exclude, no AI call (2026-08-05, owner design; ceiling margin ported
+            # from AITrading 2026-08-20). Shared by both the pre-open batch and the
             # mid-day rescan; a candidate found here has zero track record of being
-            # watched rise past its own gate, unlike the On-Shore backfill path,
-            # which is where the AI-judgment exception is reserved for instead.
+            # watched rise past its own gate, unlike the On-Shore backfill path, which
+            # is where the AI-judgment exception is reserved for instead. A candidate
+            # only just above its own gate (within ceiling_margin) is still admitted
+            # here -- see _on_deck_rr_ceiling_exceeded's docstring for why.
             entry = self.add_ai_log(ticker, phase_tag,
-                f"Not added — R/R {rr_val:.2f} above its own gate ({required_rr:.2f}) "
-                "on first look", "neutral")
+                f"Not added — R/R {rr_val:.2f} above ceiling ({required_rr + ceiling_margin:.2f}, "
+                f"its own gate {required_rr:.2f} + {ceiling_margin:.2f} margin) on first look",
+                "neutral")
             await self.broadcast({"type": "ai_log", "entry": entry})
             return False
 
@@ -7565,6 +7618,7 @@ async def save_settings(payload: dict):
         "research.on_deck_removal_conviction": float,
         "research.min_risk_reward_ratio": float,
         "research.on_deck_rr_floor_margin": lambda v: (float(v) if v not in ("", None) else None),
+        "research.on_deck_rr_ceiling_margin": float,
         "research.on_deck_rr_conviction_step": float,
         "research.on_deck_rr_floor": float,
         "research.watchlist_size": int,
