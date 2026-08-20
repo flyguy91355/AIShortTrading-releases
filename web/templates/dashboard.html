@@ -3199,27 +3199,49 @@ async function applyUpdate() {
 // (the server itself waits 2s before even issuing the restart) and gives up
 // after 60s, matching this project's condition-based-waiting precedent over
 // arbitrary timeouts.
+//
+// A 401 is treated as "back up" too, same as a real 2xx (2026-08-20, real
+// incident) -- a 401 can only happen once the server has fully restarted and
+// is actively evaluating the request's session, so it's just as conclusive a
+// "the server is up" signal as resp.ok, even though THIS tab's specific
+// session may no longer be valid (e.g. an update that changes how sessions
+// are signed/scoped, as happened live the day this was found -- see
+// CLAUDE_HISTORY.md). Before this fix, a stale-but-otherwise-fine session
+// caused every poll to hit the generic "not ok, keep waiting" branch
+// indefinitely, so the reload that would have taken the user straight to a
+// normal login screen never fired -- the page just sat on "Applying..."
+// forever with no path back except manually reloading blind.
 function pollUntilBackUpThenReload() {
   const statusEl = document.getElementById('applyUpdateStatus');
   let attempts = 0;
   const maxAttempts = 30;
+  // A real, clickable action rather than passive text once genuinely exhausted (2026-08-20)
+  // -- same reason as the resp.status === 401 branch above: a page that just sits there
+  // asking the owner to "reload manually" with nothing to click is easy to miss and leaves
+  // the apparent hang unresolved even once the code correctly gives up waiting.
+  const giveUp = () => {
+    if (statusEl) {
+      statusEl.innerHTML = 'Still restarting — <a href="#" onclick="location.reload();return false;" ' +
+        'style="color:var(--accent);">click to reload now</a>.';
+    }
+  };
   setTimeout(function poll() {
     attempts++;
     fetch('/api/update-status')
       .then(resp => {
-        if (resp.ok) {
+        if (resp.ok || resp.status === 401) {
           location.reload();
         } else if (attempts < maxAttempts) {
           setTimeout(poll, 2000);
-        } else if (statusEl) {
-          statusEl.textContent = 'Still restarting — reload the page manually when ready.';
+        } else {
+          giveUp();
         }
       })
       .catch(() => {
         if (attempts < maxAttempts) {
           setTimeout(poll, 2000);
-        } else if (statusEl) {
-          statusEl.textContent = 'Still restarting — reload the page manually when ready.';
+        } else {
+          giveUp();
         }
       });
   }, 3000);
