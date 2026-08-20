@@ -627,6 +627,17 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
+          <div class="setting-label">Allow Dividend Stocks <button type="button" class="info-btn" onclick="showInfo(event,'Being short a stock through its ex-dividend date means YOU owe the dividend to whoever the shares were borrowed from -- a real cash cost that this system does not model in its P&amp;L, and Alpaca\'s paper account does not simulate either, so paper results will look better than a real short through a dividend date actually performs. Disabled = any ticker that pays a dividend is rejected in the free quick-screen pre-filter itself, before any Claude spend -- it never even reaches On Shore/On Deck. Enabled = no filter (the historical default, matches every scan run before this setting existed).')">i</button></div>
+          <div class="setting-desc">Whether a dividend-paying stock can be screened as a short candidate at all</div>
+        </div>
+        <select class="setting-input" name="research.allow_dividend_stocks">
+          <option value="true" {% if cfg.research.allow_dividend_stocks %}selected{% endif %}>Enabled (no filter)</option>
+          <option value="false" {% if not cfg.research.allow_dividend_stocks %}selected{% endif %}>Disabled (exclude dividend payers)</option>
+        </select>
+        <div class="default-label">default<br><span class="default-val">On</span></div>
+      </div>
+      <div class="setting-row">
+        <div>
           <div class="setting-label">On Deck Conviction Watch Band <button type="button" class="info-btn" onclick="showInfo(event,'A stock scoring just below Min Conviction Score (within this many points) still gets added to On Deck and continuously watched/re-analyzed -- it just cannot actually be bought until a later fresh analysis pushes it back to or above the real entry gate. Expressed as a differential off Min Conviction Score rather than an independent number, so it automatically follows if that gate is ever changed. Example: gate 7.0, band 0.3 -> a 6.8 clears population but still cannot buy; a 6.7 does not even get tracked. Set to 0 to disable and require the full gate just to be tracked at all.')">i</button></div>
           <div class="setting-desc">Track stocks scoring up to this far below the entry gate, without letting them buy</div>
         </div>
@@ -1342,6 +1353,7 @@ const DEFAULTS = {
   'risk_management.trailing_stop_follow_tp_targets': 'false',
   'risk_management.protection_gap_alert_delay_seconds': 30,
   'research.min_conviction_score': 6.8,
+  'research.allow_dividend_stocks': 'true',
   'research.on_deck_conviction_band': 0.2,
   'research.on_deck_removal_conviction': 3,
   'research.min_risk_reward_ratio': 2.1,

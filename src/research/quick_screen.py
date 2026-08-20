@@ -83,8 +83,25 @@ def _rsi(closes: np.ndarray, period: int = 14) -> float:
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
-def quick_screen(ticker: str) -> tuple[bool, str]:
-    """Return (passes, reason). Synchronous — run in executor from async code."""
+def _pays_dividend(info_full: dict) -> bool:
+    """True when a yfinance .info dict shows a real, nonzero dividend -- checks
+    dividendRate (a dollar amount) and dividendYield (a decimal fraction) since either
+    can be populated (or None/0) depending on the ticker; a stock with neither field
+    set, or both falsy, doesn't pay one. Pure and separately tested (2026-08-20) since
+    quick_screen() itself needs a live yfinance mock to exercise at all."""
+    return bool(info_full.get("dividendRate") or info_full.get("dividendYield"))
+
+
+def quick_screen(ticker: str, allow_dividend_stocks: bool = True) -> tuple[bool, str]:
+    """Return (passes, reason). Synchronous — run in executor from async code.
+
+    allow_dividend_stocks (2026-08-20, owner request): being short through an
+    ex-dividend date means the short seller owes the dividend to whoever the
+    shares were borrowed from -- a real cash cost this system doesn't model in
+    P&L and Alpaca's paper account doesn't simulate either. When False, any
+    ticker that pays a dividend is rejected here, before any Claude spend --
+    never just flagged after the fact. Defaults to True (no filter) to match
+    every scan's behavior before this setting existed."""
     try:
         t = yf.Ticker(ticker)
         info = t.fast_info
@@ -124,12 +141,17 @@ def quick_screen(ticker: str) -> tuple[bool, str]:
             chg = (closes[-1] / closes[-20] - 1) * 100
             return False, f"too strong (${chg:+.1f}% vs 20d ago)"
 
-        # P/E check last — needs yfinance's slower full .info call, so only pay that
-        # cost for stocks that already survived every free/instant check above.
+        # P/E + dividend checks last — need yfinance's slower full .info call, so only
+        # pay that cost for stocks that already survived every free/instant check above.
         try:
-            pe = t.info.get("trailingPE")
+            info_full = t.info
         except Exception:
-            pe = None
+            info_full = {}
+
+        if not allow_dividend_stocks and _pays_dividend(info_full):
+            return False, "pays a dividend (excluded by setting)"
+
+        pe = info_full.get("trailingPE")
         if pe is not None and pe < _MIN_TRAILING_PE:
             return False, f"not overvalued enough (P/E {pe:.0f})"
 

@@ -60,17 +60,23 @@ _SQLITE_TIMEOUT_SECS = 20.0
 from src.research.rr_curve import dip_summary, price_sparkline, rr_at_price, rr_points, rr_sparkline
 
 
-async def _quick_screen_with_timeout(ticker: str) -> tuple[bool, str] | None:
+async def _quick_screen_with_timeout(
+        ticker: str, allow_dividend_stocks: bool = True) -> tuple[bool, str] | None:
     """Shared wrapper for quick_screen() with the 15s hang-protection timeout above --
     extracted (2026-08-03) after the identical try/except block was independently
     copy-pasted into both _run_pre_open_batch's and _run_midday_rescan's inner chunk
     generators, including the same comment -- the exact "duplicated logic drifts"
     failure class this project has hit before (population floor, composite score,
     admission gates). Returns None on any error or timeout (caller should `continue`
-    to the next ticker); returns quick_screen()'s real (passes, reason) tuple otherwise."""
+    to the next ticker); returns quick_screen()'s real (passes, reason) tuple otherwise.
+
+    allow_dividend_stocks (2026-08-20) is threaded through from the caller's own
+    config read (this is a bare module-level function with no self.config access of
+    its own) straight to quick_screen()."""
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(quick_screen, ticker), timeout=_QUICK_SCREEN_TIMEOUT_SECS)
+            asyncio.to_thread(quick_screen, ticker, allow_dividend_stocks),
+            timeout=_QUICK_SCREEN_TIMEOUT_SECS)
     except Exception as _qs_err:
         # Exception already covers asyncio.TimeoutError (an alias for the builtin
         # TimeoutError, itself an OSError subclass) -- no separate branch needed.
@@ -7145,6 +7151,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             min_conviction = self.config["research"]["min_conviction_score"]
             conviction_band = self.config["research"].get("on_deck_conviction_band", 0.0)
             population_floor = _on_deck_population_floor(min_conviction, conviction_band)
+            allow_dividend_stocks = self.config["research"].get("allow_dividend_stocks", True)
             today_str = self._now_et().strftime("%Y-%m-%d")
             tag = f"MID-DAY{f' {slot_label}' if slot_label else ''}"
 
@@ -7185,7 +7192,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     # (_run_pre_open_batch); this is a supplementary pass, not a second
                     # sweep, so it must not interfere with where the cursor resumes tomorrow.
 
-                    result = await _quick_screen_with_timeout(ticker)
+                    result = await _quick_screen_with_timeout(ticker, allow_dividend_stocks)
                     if result is None:
                         continue
                     passes, _reason = result
@@ -7278,6 +7285,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         # happens to rediscover it from scratch.
         conviction_band = self.config["research"].get("on_deck_conviction_band", 0.0)
         population_floor = _on_deck_population_floor(min_conviction, conviction_band)
+        allow_dividend_stocks = self.config["research"].get("allow_dividend_stocks", True)
 
         async def _log(ticker: str, msg: str, level: str = "neutral"):
             entry = self.add_ai_log(ticker, source_label, msg, level)
@@ -7324,7 +7332,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                         (STOCK_UNIVERSE.index(ticker) + 1) % len(STOCK_UNIVERSE))
 
                 # Quick screen first — free, no Claude, filters ~97% of universe now
-                result = await _quick_screen_with_timeout(ticker)
+                result = await _quick_screen_with_timeout(ticker, allow_dividend_stocks)
                 if result is None:
                     continue
                 passes, _reason = result
@@ -7552,6 +7560,7 @@ async def save_settings(payload: dict):
         "risk_management.trailing_stop_follow_tp_targets": lambda v: v == "true",
         "risk_management.protection_gap_alert_delay_seconds": int,
         "research.min_conviction_score": float,
+        "research.allow_dividend_stocks": lambda v: v == "true",
         "research.on_deck_conviction_band": float,
         "research.on_deck_removal_conviction": float,
         "research.min_risk_reward_ratio": float,
