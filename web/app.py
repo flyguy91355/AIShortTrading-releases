@@ -1493,6 +1493,10 @@ class DashboardState:
         # on_deck_notes: must survive a block clearing, since the underlying low doesn't
         # become fresh again just because the block lifted.
         self.on_deck_stale_dip_low: dict[str, float] = {}
+        # Real Alpaca shortability lookups, cached to avoid re-hitting the broker's
+        # asset endpoint on every quick_screen survivor (2026-08-20) -- ticker -> (is
+        # shortable, checked-at unix timestamp). See _is_shortable's docstring.
+        self._shortability_cache: dict[str, tuple[bool, float]] = {}
         # Cached AI portfolio health assessment (2026-07-20) — one entry, not per-ticker.
         # In-memory only, no disk persistence — cheap to regenerate, non-critical.
         # 30-minute TTL enforced at the /api/portfolio-health endpoint.
@@ -3243,6 +3247,46 @@ class DashboardState:
             except Exception:
                 return False, ""  # fail open — never block a buy due to data errors
         return await asyncio.to_thread(_fetch)
+
+    async def _is_shortable(self, ticker: str) -> bool:
+        """Real Alpaca shortability check (2026-08-20) -- unlike AITrading's own fork,
+        which never needed to ask this question at all (fractional/notional long buys
+        don't have a "can this even be shorted" concept), this system's only real order
+        path is a genuine short sale, which Alpaca can and does refuse for a stock that
+        isn't currently shortable or is hard to borrow. Without this, the first sign of
+        trouble would be a rejected broker order after a real, paid Claude analysis --
+        this checks first, mirroring the wash-sale cooldown's own "check before spending
+        a Claude call" principle (see _wash_sale_blocked).
+
+        Cached per ticker for research.shortability_cache_hours (default 24) -- real
+        borrow availability can genuinely change day to day, but doesn't need per-tick
+        freshness, and hitting the broker's asset endpoint for every quick_screen
+        survivor on every scan would be wasteful. AlpacaBroker.get_asset() itself already
+        fails soft (returns None) on a lookup error; this method fails OPEN on that same
+        None (assume shortable) rather than blocking real analysis over a transient data
+        problem -- same "never let a free safety check become the reason nothing ever
+        gets bought" principle _earnings_soon already uses. get_asset is Alpaca-specific
+        (not on the shared Broker ABC, same precedent as get_position) -- a broker
+        without it is treated the same as a failed lookup: fail open."""
+        cached = self._shortability_cache.get(ticker)
+        if cached is not None:
+            is_shortable, checked_at = cached
+            ttl_secs = self.config.get("research", {}).get("shortability_cache_hours", 24) * 3600
+            if datetime.now().timestamp() - checked_at < ttl_secs:
+                return is_shortable
+        get_asset = getattr(self.order_manager.broker, "get_asset", None)
+        if get_asset is None:
+            return True  # broker doesn't support this lookup -- fail open, not a block
+        asset = await get_asset(ticker)
+        if asset is None:
+            return True  # lookup failed -- fail open, matches _earnings_soon's precedent
+        # easy_to_borrow is Alpaca's own recommended live-availability signal, alongside
+        # the static shortable flag -- shortable alone can stay True for a security
+        # that's nonetheless temporarily impossible to actually borrow right now.
+        is_shortable = bool(
+            asset.get("tradable") and asset.get("shortable") and asset.get("easy_to_borrow"))
+        self._shortability_cache[ticker] = (is_shortable, datetime.now().timestamp())
+        return is_shortable
 
     async def _recent_momentum_ok(self, ticker: str, minutes: int = 10, tolerance: float = 0.997) -> bool:
         """Backward-looking pre-buy gate: is the stock flat-or-up over the last ~10 minutes,
@@ -5381,6 +5425,22 @@ class DashboardState:
                     asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
                 return
 
+            # Shortability re-check (2026-08-20) — the candidate passed this same check at
+            # admission time (quick_screen survivors), but real borrow availability can
+            # change day to day; this is the final gate before spending a real Claude call
+            # and, if that clears, a real broker order. Cached (see _is_shortable), so this
+            # is nearly always a free in-memory hit, not a fresh network round-trip.
+            if not await self._is_shortable(ticker):
+                entry = self.add_ai_log(ticker, "ON_DECK",
+                    "Skipped — no longer shortable at the broker", "warning")
+                await self.broadcast({"type": "ai_log", "entry": entry})
+                self._record_promotion_attempt(ticker, dip_low, "No longer shortable")
+                self.near_miss_candidates.pop(ticker, None)
+                evicted = True
+                asyncio.create_task(
+                    asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
+                return
+
             # Cheap cash pre-check (2026-07-22) — using the candidate's own cached
             # last-known price/stop (not yet the fresh re-analysis below), BEFORE paying for
             # a real Claude call that would be pointless if there's clearly not enough cash
@@ -7133,6 +7193,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                         await asyncio.sleep(0.2)
                         continue
 
+                    if not await self._is_shortable(ticker):
+                        screened_out += 1
+                        continue
+
                     buffer.append(ticker)
                     if len(buffer) >= 100:
                         yield buffer
@@ -7266,6 +7330,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 if not passes:
                     screened_out += 1
                     await asyncio.sleep(0.2)
+                    continue
+
+                if not await self._is_shortable(ticker):
+                    screened_out += 1
                     continue
 
                 buffer.append(ticker)

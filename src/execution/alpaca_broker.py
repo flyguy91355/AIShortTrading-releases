@@ -431,3 +431,29 @@ class AlpacaBroker(Broker):
         quote = await self._call_with_rate_limit_retry(self.api.get_latest_quote, ticker)
         price = quote.ap if quote.ap is not None else quote.bp
         return float(price) if price is not None else None
+
+    async def get_asset(self, ticker: str) -> dict | None:
+        """Real Alpaca asset metadata for a ticker (2026-08-20, shortability check) --
+        verified against Alpaca's real GET /v2/assets/{symbol} response and confirmed
+        live against the real paper API (AAPL: shortable=True, tradable=True,
+        status='active', easy_to_borrow=True) before being wired into anything. Alpaca's
+        own docs recommend easy_to_borrow=True (a live availability signal) alongside the
+        static shortable flag as "the best way to check whether the name is currently
+        available to short at Alpaca" -- shortable alone can be True for a security that's
+        nonetheless temporarily impossible to actually borrow. Not on the shared Broker
+        ABC (same precedent as get_position/get_closed_orders) -- Alpaca-specific, callers
+        use getattr() to stay broker-agnostic. Returns None on any failure (ticker not
+        found, network error) rather than raising -- callers should fail open on a lookup
+        failure, matching this codebase's existing pattern for other free/cheap safety
+        checks (e.g. _earnings_soon)."""
+        try:
+            asset = await self._call_with_rate_limit_retry(self.api.get_asset, ticker)
+        except Exception as e:
+            logger.warning("get_asset failed for %s: %s", ticker, e)
+            return None
+        return {
+            "tradable": bool(getattr(asset, "tradable", False)),
+            "shortable": bool(getattr(asset, "shortable", False)),
+            "easy_to_borrow": bool(getattr(asset, "easy_to_borrow", False)),
+            "status": getattr(asset, "status", ""),
+        }
