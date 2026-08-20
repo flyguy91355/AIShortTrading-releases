@@ -1163,18 +1163,20 @@ class OrderManager:
                 err_str = str(e).lower()
                 if "stop price must be" in err_str and "current price" in err_str:
                     # Price has already moved through the intended stop level (e.g. a
-                    # trailing-stop trigger held off pre-market, then price kept falling
+                    # trailing-stop trigger held off pre-market, then price kept rising
                     # before sync_exit_orders got a chance to re-place a valid stop —
-                    # see CLAUDE.md "Auto-close market-open race"). A sell-stop must sit
-                    # below current price to be valid, so a rejection with this exact
-                    # error means the position should already be sold, not left with an
-                    # unplaceable stop.
+                    # see CLAUDE.md "Auto-close market-open race"). This order is a
+                    # BUY-stop (buy_to_close, short economics) -- verified against
+                    # Alpaca's real docs: a buy-stop must sit ABOVE current price to be
+                    # valid, so a rejection with this exact error means price has already
+                    # risen past it and the position should already be covered, not left
+                    # with an unplaceable stop.
                     #
                     # Sell the ENTIRE remaining position (`shares`), not just
                     # `stop_shares` (2026-07-30, ADC/SCHW incident) -- once the stop
                     # itself has been breached, there's no good reason to leave the other
-                    # half sitting on a take-profit limit order above a price that has
-                    # already fallen through the risk-management exit level. The old
+                    # half sitting on a take-profit limit order below a price that has
+                    # already risen through the risk-management exit level. The old
                     # "only stop_shares, TP portion still gets placed below" behavior
                     # caused a runaway loop: every subsequent sync_exit_orders pass saw
                     # the same (already-covered) TP portion, miscounted it as a fresh,

@@ -508,8 +508,8 @@ input[type=time].setting-input { font-family: monospace; }
     <div class="settings-grid">
       <div class="setting-row">
         <div>
-          <div class="setting-label">Stop Loss % <button type="button" class="info-btn" onclick="showInfo(event,'How far below the entry price the initial stop-loss order is placed, as a percentage. Example: 5% on a $100 entry puts the stop at $95. Every position must have a stop — the system will not open a trade without one. Used with Max Loss Per Trade to calculate position size.')">i</button></div>
-          <div class="setting-desc">Initial stop loss placed this far below entry price</div>
+          <div class="setting-label">Stop Loss % <button type="button" class="info-btn" onclick="showInfo(event,'How far above the entry price the initial stop-loss order is placed, as a percentage (this system only opens short positions, so the stop protects against price rising). Example: 5% on a $100 entry puts the stop at $105. Every position must have a stop — the system will not open a trade without one. Used with Max Loss Per Trade to calculate position size.')">i</button></div>
+          <div class="setting-desc">Initial stop loss placed this far above entry price</div>
         </div>
         <input type="number" class="setting-input" name="take_profit.stop_loss_pct"
                value="{{ cfg.take_profit.stop_loss_pct }}" min="1" max="20" step="0.5">
@@ -528,7 +528,7 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">AI Stop-Loss Min % <button type="button" class="info-btn" onclick="showInfo(event,'Only used when AI-Chosen Stop-Loss/Take-Profit above is Enabled. The tightest a Claude-chosen stop-loss is allowed to be, as a percentage below entry -- guards against a bad technical read producing a degenerate, too-tight stop.')">i</button></div>
+          <div class="setting-label">AI Stop-Loss Min % <button type="button" class="info-btn" onclick="showInfo(event,'Only used when AI-Chosen Stop-Loss/Take-Profit above is Enabled. The tightest a Claude-chosen stop-loss is allowed to be, as a percentage above entry (this system only opens short positions) -- guards against a bad technical read producing a degenerate, too-tight stop.')">i</button></div>
           <div class="setting-desc">Sanity floor for an AI-chosen stop (AI-chosen mode only)</div>
         </div>
         <input type="number" class="setting-input" name="research.ai_stop_loss_min_pct"
@@ -537,7 +537,7 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">AI Stop-Loss Max % <button type="button" class="info-btn" onclick="showInfo(event,'Only used when AI-Chosen Stop-Loss/Take-Profit above is Enabled. The widest a Claude-chosen stop-loss is allowed to be, as a percentage below entry -- guards against a bad technical read producing a degenerate, too-wide stop that blows past the intended risk-per-trade sizing.')">i</button></div>
+          <div class="setting-label">AI Stop-Loss Max % <button type="button" class="info-btn" onclick="showInfo(event,'Only used when AI-Chosen Stop-Loss/Take-Profit above is Enabled. The widest a Claude-chosen stop-loss is allowed to be, as a percentage above entry (this system only opens short positions) -- guards against a bad technical read producing a degenerate, too-wide stop that blows past the intended risk-per-trade sizing.')">i</button></div>
           <div class="setting-desc">Sanity ceiling for an AI-chosen stop (AI-chosen mode only)</div>
         </div>
         <input type="number" class="setting-input" name="research.ai_stop_loss_max_pct"
@@ -546,8 +546,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">T1 Target % <button type="button" class="info-btn" onclick="showInfo(event,'First take-profit level, as a percentage above entry price. When hit, one-third of the position is sold and the stop-loss is raised to breakeven. This triggers the staged exit system. Setting T1 too close to the stop creates a poor risk/reward ratio and may block trades from passing the R/R filter.')">i</button></div>
-          <div class="setting-desc">First take-profit — sell ⅓ here, raise stop to breakeven</div>
+          <div class="setting-label">T1 Target % <button type="button" class="info-btn" onclick="showInfo(event,'First take-profit level, as a percentage below entry price (this system only opens short positions, so profit comes from price falling). When hit, one-third of the position is bought back and the stop-loss is lowered to breakeven. This triggers the staged exit system. Setting T1 too close to the stop creates a poor risk/reward ratio and may block trades from passing the R/R filter.')">i</button></div>
+          <div class="setting-desc">First take-profit — cover ⅓ here, lower stop to breakeven</div>
         </div>
         <input type="number" class="setting-input" name="take_profit.t1_pct"
                value="{{ cfg.take_profit.t1_pct }}" min="1" max="30" step="0.5">
@@ -555,8 +555,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">T2 Target % <button type="button" class="info-btn" onclick="showInfo(event,'Second take-profit level. After T1 fills, the remaining two-thirds becomes one-third sold here and one-third held for T3. The stop-loss is raised again after T2 fills. Must be higher than T1.')">i</button></div>
-          <div class="setting-desc">Second take-profit — sell ⅓ here, raise stop again</div>
+          <div class="setting-label">T2 Target % <button type="button" class="info-btn" onclick="showInfo(event,'Second take-profit level. After T1 fills, the remaining two-thirds becomes one-third bought back here and one-third held for T3. The stop-loss is lowered again after T2 fills. Must be lower than T1 (further below entry).')">i</button></div>
+          <div class="setting-desc">Second take-profit — cover ⅓ here, lower stop again</div>
         </div>
         <input type="number" class="setting-input" name="take_profit.t2_pct"
                value="{{ cfg.take_profit.t2_pct }}" min="1" max="50" step="0.5">
@@ -682,7 +682,7 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">Long-Term Trend Years <button type="button" class="info-btn" onclick="showInfo(event,'How many years of price history feed the LONG-TERM TREND context included in every analysis prompt, alongside the usual 1-year technicals. A stock that fell for years and has since rallied hard can look like a fresh breakout in a 1-year window alone, with no visibility into whether the rally is a genuine turnaround or just a bounce back toward a much bigger prior decline. 5 years balances catching a real structural high/low against pulling in irrelevant decades-old history.')">i</button></div>
+          <div class="setting-label">Long-Term Trend Years <button type="button" class="info-btn" onclick="showInfo(event,'How many years of price history feed the LONG-TERM TREND context included in every analysis prompt, alongside the usual 1-year technicals. A stock that rose for years and has since fallen hard can look like a fresh breakdown in a 1-year window alone, with no visibility into whether the decline is a genuine structural top or just a pullback from a much bigger prior rise. 5 years balances catching a real structural high/low against pulling in irrelevant decades-old history.')">i</button></div>
           <div class="setting-desc">Years of history summarized as long-term trend context in every analysis prompt</div>
         </div>
         <input type="number" step="1" class="setting-input" name="research.long_term_trend_years"
@@ -711,8 +711,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">AI Entry Arm Band % <button type="button" class="info-btn" onclick="showInfo(event,'How far ABOVE the AI-recommended entry price still counts as \'close enough\' to arm the buy trigger, instead of requiring price to fully cross below the exact entry first. Added 2026-08-04 after live monitoring found every recommendation started unarmed (price already above entry when Claude computed it, since it reasons about a support level below wherever price has already recovered to) -- in a persistently rising market that never gives back even a percent or two, an unarmed candidate could wait indefinitely for a pullback that never comes. Still requires real proof price got genuinely close to the reasoned support level -- just not the full round-trip back through it. Set to 0 to restore the original strict behavior (must fully cross below entry).')">i</button></div>
-          <div class="setting-desc">% above the AI entry price that still counts as close enough to arm the buy trigger</div>
+          <div class="setting-label">AI Entry Arm Band % <button type="button" class="info-btn" onclick="showInfo(event,'How far BELOW the AI-recommended entry price still counts as \'close enough\' to arm the short trigger, instead of requiring price to fully cross above the exact entry first (this system only opens short positions). Live monitoring found every recommendation started unarmed (price already below entry when Claude computed it, since it reasons about a resistance level above wherever price has already rolled over to) -- in a persistently falling market that never bounces back even a percent or two, an unarmed candidate could wait indefinitely for a bounce that never comes. Still requires real proof price got genuinely close to the reasoned resistance level -- just not the full round-trip back through it. Set to 0 to restore the original strict behavior (must fully cross above entry).')">i</button></div>
+          <div class="setting-desc">% below the AI entry price that still counts as close enough to arm the short trigger</div>
         </div>
         <input type="number" step="0.1" class="setting-input" name="research.on_deck_ai_entry_arm_band_pct"
                value="{{ cfg.research.on_deck_ai_entry_arm_band_pct }}" min="0" max="20">
@@ -720,8 +720,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">On Deck Retracement % <button type="button" class="info-btn" onclick="showInfo(event,'How much of the dip an On Deck candidate must retrace before it gets bought, measured from the previous peak (the highest price in the history window before the low) down to the low. A stock that fell $10 and must retrace 20% needs to recover $2 off its low, scaling naturally to the size of the dip instead of asking the same flat bounce regardless of how far a stock actually fell. Prevents buying into a stock that is still actively falling; R/R crossing the gate alone does not confirm the price has actually turned. Requires a real peak-to-low move already recorded in the history window, so a brand new candidate with no prior peak yet cannot pass this check until one exists. Only used when Entry Mode above is set to Fixed % retracement -- still computed and shown on the chart for comparison even in AI mode.')">i</button></div>
-          <div class="setting-desc">% of the peak-to-low dip that must be retraced before an On Deck buy fires (Fixed % mode only)</div>
+          <div class="setting-label">On Deck Retracement % <button type="button" class="info-btn" onclick="showInfo(event,'How much of the rally an On Deck candidate must roll over before it gets shorted, measured from the previous low (the lowest price in the history window before the peak) up to the peak. A stock that rose $10 and must retrace 20% needs to fall $2 off its peak, scaling naturally to the size of the rally instead of asking the same flat pullback regardless of how far a stock actually rose. Prevents shorting into a stock that is still actively rising; R/R crossing the gate alone does not confirm the price has actually turned. Requires a real low-to-peak move already recorded in the history window, so a brand new candidate with no prior low yet cannot pass this check until one exists. Only used when Entry Mode above is set to Fixed % retracement -- still computed and shown on the chart for comparison even in AI mode.')">i</button></div>
+          <div class="setting-desc">% of the low-to-peak rally that must be retraced before an On Deck short fires (Fixed % mode only)</div>
         </div>
         <input type="number" step="1" class="setting-input" name="research.on_deck_retracement_pct"
                value="{{ cfg.research.on_deck_retracement_pct }}" min="5" max="100">
@@ -729,8 +729,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">Dip-Recovery Retry % <button type="button" class="info-btn" onclick="showInfo(event,'After a dip-recovery promotion attempt fails (conviction, signal, or R/R didn\'t hold up on a fresh Claude check), the candidate won\'t be tried again for the SAME dip low until either a genuinely new, deeper low forms, or price has recovered at least this many percent further past the price where that attempt failed. Without this, a candidate whose tracked low never prints a new value could stay stuck indefinitely no matter how far price has since recovered, even after clearing every other gate. Mirrors the equivalent escape hatch the no-dip uptrend trigger already has.')">i</button></div>
-          <div class="setting-desc">Min. % price must recover past a failed attempt's level before retrying the same dip</div>
+          <div class="setting-label">Rally-Rollover Retry % <button type="button" class="info-btn" onclick="showInfo(event,'After a rally-rollover promotion attempt fails (conviction, signal, or R/R didn\'t hold up on a fresh Claude check), the candidate won\'t be tried again for the SAME rally peak until either a genuinely new, higher peak forms, or price has fallen at least this many percent further past the price where that attempt failed. Without this, a candidate whose tracked peak never prints a new value could stay stuck indefinitely no matter how far price has since fallen, even after clearing every other gate. Mirrors the equivalent escape hatch the no-rally downtrend trigger already has.')">i</button></div>
+          <div class="setting-desc">Min. % price must fall past a failed attempt's level before retrying the same rally</div>
         </div>
         <input type="number" step="0.5" class="setting-input" name="research.on_deck_recovery_retry_pct"
                value="{{ cfg.research.on_deck_recovery_retry_pct }}" min="0.1" max="20">
@@ -774,7 +774,7 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">On Deck History Window (days) <button type="button" class="info-btn" onclick="showInfo(event,'How many days of price history an On Deck candidate keeps for the retracement check (finding the previous peak and low to measure the dip against). Large, slower-moving stocks can take multiple days or weeks to bottom and recover, so a single trading day is often too short a window to catch the real peak and low. History rolls off past this many days; the candidate itself can still remain on the list indefinitely as long as conviction holds up.')">i</button></div>
+          <div class="setting-label">On Deck History Window (days) <button type="button" class="info-btn" onclick="showInfo(event,'How many days of price history an On Deck candidate keeps for the retracement check (finding the previous low and peak to measure the rally against). Large, slower-moving stocks can take multiple days or weeks to top and roll over, so a single trading day is often too short a window to catch the real low and peak. History rolls off past this many days; the candidate itself can still remain on the list indefinitely as long as conviction holds up.')">i</button></div>
           <div class="setting-desc">Rolling window of price history used to find the peak and low for the retracement check</div>
         </div>
         <input type="number" class="setting-input" name="research.on_deck_history_days"
@@ -1166,8 +1166,8 @@ input[type=time].setting-input { font-family: monospace; }
       </div>
       <div class="setting-row">
         <div>
-          <div class="setting-label">Dip-Entry Model <button type="button" class="info-btn" onclick="showInfo(event,'The Claude model used for the one-time AI dip-entry recommendation, fired when a tracked On Deck candidate shows a real, already-recovering price dip. Split off from Quick Scan Model (2026-07-24).')">i</button></div>
-          <div class="setting-desc">Model used for the AI dip-entry price recommendation</div>
+          <div class="setting-label">Short-Entry Model <button type="button" class="info-btn" onclick="showInfo(event,'The Claude model used for the one-time AI short-entry recommendation, fired when a tracked On Deck candidate shows a real, already-rolling-over price rally. Split off from Quick Scan Model.')">i</button></div>
+          <div class="setting-desc">Model used for the AI short-entry price recommendation</div>
         </div>
         <select class="setting-input" name="research.model_dip_entry">
           <option value="claude-haiku-4-5" {% if (cfg.research.model_dip_entry|default('claude-haiku-4-5')) == 'claude-haiku-4-5' %}selected{% endif %}>Haiku 4.5 — Fastest / Cheapest</option>

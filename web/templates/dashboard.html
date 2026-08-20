@@ -2337,9 +2337,12 @@ function renderPositions(positions) {
     const dayPnl = p.day_pnl != null ? p.day_pnl : 0;
     const dayPnlPct = p.day_pnl_pct != null ? p.day_pnl_pct : 0;
     const dayPnlCl = dayPnl >= 0 ? 'color:var(--green)' : 'color:var(--red)';
-    const trailActive = p.trailing_stop && p.trailing_stop > p.stop_loss;
+    // Short economics (2026-08-20): trailing stop ratchets DOWN (tighter) as price
+    // falls, so an active trail sits BELOW the original hard stop, not above it.
+    const trailActive = p.trailing_stop && p.trailing_stop < p.stop_loss;
     const effectiveStop = trailActive ? p.trailing_stop : p.stop_loss;
-    const nearStop = effectiveStop > 0 && p.current_price <= effectiveStop * 1.02;
+    // "Near stop" now means price has risen UP close to a stop that sits above it.
+    const nearStop = effectiveStop > 0 && p.current_price >= effectiveStop * 0.98;
     const sharesStr = typeof p.shares === 'number' && p.shares % 1 !== 0
       ? p.shares.toFixed(4) : p.shares;
     const trailPctStr = (trailActive && p.trailing_stop_pct != null)
@@ -2352,22 +2355,24 @@ function renderPositions(positions) {
     // backend change needed. Deliberately a different % meaning than trailPctStr above
     // (that one is trail WIDTH; this one is % distance from entry to the hard stop) --
     // only shown when NOT trailActive, so the two never appear together and can't be
-    // confused for the same number.
+    // confused for the same number. Short economics: stop sits ABOVE entry, shown as a
+    // "+X%" distance, not "-X%".
     const stopPctStr = (!trailActive && p.stop_loss > 0 && p.entry_price > 0)
-      ? ` (-${((p.entry_price - p.stop_loss) / p.entry_price * 100).toFixed(1)}%)` : '';
-    // Stop-column color (2026-07-28, user request): compares the EFFECTIVE stop (trailing
-    // if active, else the plain hard stop-loss) against entry price -- green once the stop
-    // itself has ratcheted to/above entry (the position can no longer close at a loss,
-    // regardless of where price currently sits). While the stop is still below entry,
-    // current price is the tiebreaker: red if price is ALSO below entry (still genuinely
-    // at risk on both counts), white/default if price has already recovered to/above entry
-    // but the stop just hasn't caught up yet (a transitional, not-yet-locked-in state).
+      ? ` (+${((p.stop_loss - p.entry_price) / p.entry_price * 100).toFixed(1)}%)` : '';
+    // Stop-column color (2026-07-28, user request; short economics 2026-08-20): compares
+    // the EFFECTIVE stop (trailing if active, else the plain hard stop-loss) against
+    // entry price -- green once the stop itself has ratcheted to/below entry (the
+    // position can no longer close at a loss, regardless of where price currently sits).
+    // While the stop is still above entry, current price is the tiebreaker: red if price
+    // is ALSO above entry (still genuinely at risk on both counts), white/default if
+    // price has already fallen to/below entry but the stop just hasn't caught up yet (a
+    // transitional, not-yet-locked-in state).
     const stopValueStr = trailActive
-      ? `↑ $${p.trailing_stop.toFixed(2)}${trailPctStr}`
+      ? `↓ $${p.trailing_stop.toFixed(2)}${trailPctStr}`
       : `$${p.stop_loss.toFixed(2)}${stopPctStr}`;
-    const stopColor = effectiveStop >= p.entry_price
+    const stopColor = effectiveStop <= p.entry_price
       ? 'var(--green)'
-      : p.current_price < p.entry_price
+      : p.current_price > p.entry_price
       ? 'var(--red)'
       : null;
     const stopCell = stopColor
@@ -3642,8 +3647,8 @@ async function showPositionDetail(ticker) {
   if (p.entry_price !== p.current_price) {
     levels.push({ label: 'Entry', price: p.entry_price, type: 'pl-entry', desc: timeOwnedStr || '' });
   }
-  if (p.trailing_stop && p.trailing_stop > p.stop_loss) {
-    levels.push({ label: '↑ Trail', price: p.trailing_stop, type: 'pl-stop', desc: 'trailing — ratchets up' });
+  if (p.trailing_stop && p.trailing_stop < p.stop_loss) {
+    levels.push({ label: '↓ Trail', price: p.trailing_stop, type: 'pl-stop', desc: 'trailing — ratchets down' });
     if (p.stop_loss > 0) {
       levels.push({ label: 'Hard Stop', price: p.stop_loss, type: 'pl-stop', desc: 'Alpaca floor' });
     }
@@ -3679,11 +3684,11 @@ async function showPositionDetail(ticker) {
   const sharesStr = typeof p.shares === 'number' && p.shares % 1 !== 0
     ? p.shares.toFixed(6) : p.shares;
   const costBasis = (p.shares * p.entry_price).toFixed(2);
-  const _effStop = (p.trailing_stop && p.trailing_stop > p.stop_loss) ? p.trailing_stop : p.stop_loss;
+  const _effStop = (p.trailing_stop && p.trailing_stop < p.stop_loss) ? p.trailing_stop : p.stop_loss;
   const stopPct = _effStop > 0
     ? (((_effStop - p.current_price) / p.current_price) * 100).toFixed(1) + '%'
     : 'N/A';
-  const stopLabel = (p.trailing_stop && p.trailing_stop > p.stop_loss) ? 'Trail Distance' : 'Stop Distance';
+  const stopLabel = (p.trailing_stop && p.trailing_stop < p.stop_loss) ? 'Trail Distance' : 'Stop Distance';
 
   // "All the available info" (2026-07-20) -- every field the research/deep-dive tiers can
   // produce, not just the thesis+risk_factors subset this modal previously showed. Kept in
@@ -3835,7 +3840,7 @@ async function showPositionDetail(ticker) {
       return;
     }
     const data = await histResp.json();
-    const effStop = (data.trailing_stop && data.trailing_stop > data.stop_loss) ? data.trailing_stop : data.stop_loss;
+    const effStop = (data.trailing_stop && data.trailing_stop < data.stop_loss) ? data.trailing_stop : data.stop_loss;
     const ohlcvResp = ohlcvResult.status === 'fulfilled' ? ohlcvResult.value : null;
     const ohlcv = (ohlcvResp && ohlcvResp.ok) ? await ohlcvResp.json() : null;
     const ohlcvPoints = ohlcv && ohlcv.points && ohlcv.points.length >= 2 ? ohlcv.points : null;
@@ -3848,7 +3853,7 @@ async function showPositionDetail(ticker) {
       });
     } else {
       const refLines = [{ price: data.entry_price, label: 'Entry', color: '#7dd3fc' }];
-      if (effStop > 0) refLines.push({ price: effStop, label: data.trailing_stop && data.trailing_stop > data.stop_loss ? 'Trail Stop' : 'Stop', color: '#ff3b5c' });
+      if (effStop > 0) refLines.push({ price: effStop, label: data.trailing_stop && data.trailing_stop < data.stop_loss ? 'Trail Stop' : 'Stop', color: '#ff3b5c' });
       (data.take_profit_targets || []).forEach((t, i) => refLines.push({ price: t, label: `T${i+1}`, color: '#00e691' }));
       container.innerHTML = `<div id="posChartMount"></div><div style="text-align:right;font-size:10px;color:var(--text-muted);margin-top:2px;">${dateRangeCaption(data.points)}</div>`;
       const entryTime = data.opened_at ? Math.floor(parseUtcTimestamp(data.opened_at).getTime() / 1000) : null;
@@ -4661,7 +4666,7 @@ async function openPositionChartExpand(ticker) {
     if (ohlcvResp && ohlcvResp.ok) ohlcv = await ohlcvResp.json();
   } catch (e) { console.error('openPositionChartExpand:', e); return; }
 
-  const effStop = (data.trailing_stop && data.trailing_stop > data.stop_loss) ? data.trailing_stop : data.stop_loss;
+  const effStop = (data.trailing_stop && data.trailing_stop < data.stop_loss) ? data.trailing_stop : data.stop_loss;
   const summaryHtml = data.ai_entry_reasoning
     ? `${data.ai_entry_price != null ? `AI-recommended entry <strong style="color:var(--text-primary)">$${Number(data.ai_entry_price).toFixed(2)}</strong> — ` : ''}${data.ai_entry_reasoning}`
     : '';
@@ -4681,7 +4686,7 @@ async function openPositionChartExpand(ticker) {
     });
   } else {
     const refLines = [{ price: data.entry_price, label: 'Entry', color: '#7dd3fc' }];
-    if (effStop > 0) refLines.push({ price: effStop, label: data.trailing_stop && data.trailing_stop > data.stop_loss ? 'Trail Stop' : 'Stop', color: '#ff3b5c' });
+    if (effStop > 0) refLines.push({ price: effStop, label: data.trailing_stop && data.trailing_stop < data.stop_loss ? 'Trail Stop' : 'Stop', color: '#ff3b5c' });
     (data.take_profit_targets || []).forEach((t, i) => refLines.push({ price: t, label: `T${i+1}`, color: '#00e691' }));
     document.getElementById('chartExpandTitle').textContent = `${ticker} — Full Price History (${(data.points||[]).length} points)`;
     document.getElementById('chartExpandBody').innerHTML = `
@@ -4848,7 +4853,9 @@ function renderPositionLightweightChart(container, points, refLines, opts) {
   }
 
   const lastPrice = valid[valid.length - 1].price;
-  const lineColor = (!entryRef || lastPrice >= entryRef.price) ? '#00e691' : '#ff3b5c';
+  // Short economics (2026-08-20): profit is price FALLING below entry, so the line is
+  // green when price is at/below entry, not at/above it.
+  const lineColor = (!entryRef || lastPrice <= entryRef.price) ? '#00e691' : '#ff3b5c';
   const result = renderLightweightChart(container, [
     { type: 'line', data: seriesData, color: lineColor },
   ], opts);

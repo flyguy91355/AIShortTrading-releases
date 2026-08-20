@@ -3289,18 +3289,20 @@ class DashboardState:
         return is_shortable
 
     async def _recent_momentum_ok(self, ticker: str, minutes: int = 10, tolerance: float = 0.997) -> bool:
-        """Backward-looking pre-buy gate: is the stock flat-or-up over the last ~10 minutes,
-        or still actively declining right now? Uses 1-minute intraday bars that already exist
-        (market_data.get_recent_closes) — no waiting, no continuous monitoring needed, unlike
-        near_miss_monitor_loop's forward-looking uptick confirmation (which serves the same
-        purpose but has to wait for future ticks since near-miss candidates aren't otherwise
-        polled). Added 2026-07-16 after VIRT was bought via the normal watchlist scan while
-        actively crashing and stopped out ~1% lower within 10 minutes — real evidence the
-        falling-knife risk isn't unique to near-miss, it applies to any buy at any moment the
-        stock happens to be sliding. tolerance=0.997 allows ~0.3% noise so ordinary bid/ask
-        wobble doesn't block a buy that's genuinely flat. Fails open (True) on any data error
-        or insufficient history (e.g. first few minutes after open) — this is a risk-reduction
-        gate, not a hard requirement, and a data hiccup should never block an otherwise-good buy."""
+        """Backward-looking pre-short gate: is the stock flat-or-down over the last ~10
+        minutes, or actively squeezing higher right now? Uses 1-minute intraday bars that
+        already exist (market_data.get_recent_closes) — no waiting, no continuous
+        monitoring needed, unlike near_miss_monitor_loop's forward-looking downtick
+        confirmation (which serves the same purpose but has to wait for future ticks
+        since near-miss candidates aren't otherwise polled). Short economics (2026-08-20):
+        mirrors AITrading's own 2026-07-16 VIRT incident (bought while actively crashing,
+        stopped out ~1% lower within 10 minutes) -- the equivalent risk for a short is
+        opening one while the stock is actively squeezing upward, right into a stop that
+        sits above entry. tolerance=0.997 allows ~0.3% noise so ordinary bid/ask wobble
+        doesn't block a short that's genuinely flat. Fails open (True) on any data error
+        or insufficient history (e.g. first few minutes after open) — this is a
+        risk-reduction gate, not a hard requirement, and a data hiccup should never block
+        an otherwise-good short."""
         try:
             closes = await self.market_data.get_recent_closes(ticker, minutes=minutes)
         except Exception as e:
@@ -3308,7 +3310,7 @@ class DashboardState:
             return True
         if len(closes) < 3:
             return True
-        return closes[-1] >= closes[0] * tolerance
+        return closes[-1] <= closes[0] * (2 - tolerance)
 
     def _is_market_open(self) -> bool:
         now = self._now_et()
@@ -4284,10 +4286,10 @@ class DashboardState:
                             ticker, position_size, effective_cash - required_reserve)
                 continue
 
-            # Momentum check — don't buy into an active decline (see _recent_momentum_ok)
+            # Momentum check — don't short into an active squeeze (see _recent_momentum_ok)
             if not await self._recent_momentum_ok(ticker):
                 entry_obj = self.add_ai_log(ticker, "AUTO_TRADE",
-                    "Skipping this scan — still actively declining over the last 10 min "
+                    "Skipping this scan — still actively rising over the last 10 min "
                     "(will re-check next scan)", "warning")
                 await self.broadcast({"type": "ai_log", "entry": entry_obj})
                 continue

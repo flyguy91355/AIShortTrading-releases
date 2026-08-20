@@ -1,208 +1,216 @@
 #!/usr/bin/env bash
-# AITrading — one-shot Ubuntu server setup
-# Tested on Ubuntu 22.04 / 24.04
-# Run as root or with sudo: bash deploy_ubuntu.sh
+# Doug's AIShortTrading — deploy to a Tailscale-connected Ubuntu server.
+#
+# 2026-08-20 rewrite: the original version of this script (inherited from the
+# AITrading fork) assumed a brand-new, unclaimed dedicated server -- it ran
+# `ufw --force reset`, set up fail2ban fresh, and git-cloned the repo onto the
+# box itself. None of that matches how this project is actually deployed: the
+# real install lives on a box already running a sibling service
+# (AICryptoTrading), reached over Tailscale, with HTTPS via a Tailscale-issued
+# cert -- not a public port behind ufw. Running the old script against that
+# box would have reset its firewall and broken the sibling service.
+#
+# This version mirrors the real steps used for the live install instead:
+#   - Run from your LOCAL machine, not on the server -- this repo's local git
+#     copy is the source of truth (same convention as AITrading and
+#     AICryptoTrading); the server never runs `git clone` or `git pull`.
+#   - Ships code via rsync, not git.
+#   - Never touches the server's firewall or fail2ban -- a shared box's
+#     network security posture is the operator's own concern, not something
+#     a per-app deploy script should reset.
+#   - HTTPS via `tailscale cert` reusing the box's own MagicDNS name, not a
+#     plain HTTP port.
+#   - Runs as root (matching the sibling services already on Hetzner boxes in
+#     this project family), not a dedicated app user.
+#   - Auto-detects an unused port rather than defaulting to 8080, since a
+#     shared box may already have other family members running.
+#
+# Usage: bash scripts/deploy_ubuntu.sh <user@host> [install-dir] [port]
+#   e.g.: bash scripts/deploy_ubuntu.sh root@100.67.94.82 /opt/aishorttrading 8082
+#
+# Idempotent where practical: safe to re-run against an already-deployed box
+# to push new code (skips venv/.env/cert/systemd steps that already exist).
+#
+# NOT live-tested end to end against a genuinely fresh box (the real install
+# this mirrors was built up manually, one verified step at a time, not by
+# running a single script) -- read through it before trusting it blind on a
+# real server, same caution the original script deserved and never got.
 
 set -euo pipefail
 
-REPO_URL="https://github.com/flyguy91355/AITrading.git"
-APP_DIR="/opt/aitrading"
-APP_USER="aitrading"
-SERVICE_NAME="aitrading"
-PORT="8080"
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <user@host> [install-dir] [port]"
+  echo "  e.g.: $0 root@100.67.94.82 /opt/aishorttrading 8082"
+  exit 1
+fi
+
+TARGET="$1"                                  # e.g. root@100.67.94.82
+APP_DIR="${2:-/opt/aishorttrading}"
+REQUESTED_PORT="${3:-}"
+SERVICE_NAME="aishorttrading"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()    { echo -e "${GREEN}[✓]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
 section() { echo -e "\n${GREEN}━━━ $* ━━━${NC}"; }
 
-if [[ $EUID -ne 0 ]]; then
-  echo -e "${RED}Run as root: sudo bash deploy_ubuntu.sh${NC}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+section "Verify SSH access"
+if ! ssh -o ConnectTimeout=10 "$TARGET" "echo connected" &>/dev/null; then
+  echo -e "${RED}Cannot reach $TARGET over SSH — check the host/key before continuing.${NC}"
   exit 1
 fi
+info "SSH access to $TARGET confirmed"
 
-section "System update"
-apt-get update -q
-apt-get upgrade -y -q
-apt-get install -y -q \
-  git curl wget ufw fail2ban \
-  software-properties-common \
-  build-essential libssl-dev libffi-dev \
-  sqlite3 pango1.0-tools libpango-1.0-0 libpangoft2-1.0-0  # weasyprint PDF deps
-info "System packages installed"
-
-section "Python 3.12"
-if ! python3.12 --version &>/dev/null; then
-  add-apt-repository -y ppa:deadsnakes/ppa
-  apt-get update -q
-  apt-get install -y -q python3.12 python3.12-venv python3.12-dev
+section "Verify Tailscale on the target"
+TS_HOSTNAME=$(ssh "$TARGET" "tailscale status --self --json 2>/dev/null" | \
+  python3 -c "import json,sys; print(json.load(sys.stdin).get('Self',{}).get('DNSName','').rstrip('.'))" 2>/dev/null || true)
+if [[ -z "$TS_HOSTNAME" ]]; then
+  echo -e "${RED}Could not determine the target's Tailscale MagicDNS name.${NC}"
+  echo "This deployment relies on Tailscale for both reachability and HTTPS (tailscale cert)."
+  echo "Install/connect Tailscale on the target first: https://tailscale.com/download"
+  exit 1
 fi
-python3.12 --version
-info "Python 3.12 ready"
+info "Target Tailscale hostname: $TS_HOSTNAME"
 
-section "App user"
-if ! id "$APP_USER" &>/dev/null; then
-  useradd -r -m -d "$APP_DIR" -s /bin/bash "$APP_USER"
-  info "Created user: $APP_USER"
-else
-  info "User $APP_USER already exists"
-fi
+section "Ship code (rsync, not git)"
+rsync -az --delete \
+  --exclude='.git' --exclude='venv' --exclude='__pycache__' \
+  --exclude='.pytest_cache' --exclude='*.pyc' --exclude='.env' \
+  --exclude='/certs' --exclude='/data' \
+  -e ssh \
+  "$REPO_ROOT/" "$TARGET:$APP_DIR/"
+info "Code synced to $TARGET:$APP_DIR"
 
-section "Clone / update repository"
-if [[ -d "$APP_DIR/.git" ]]; then
-  warn "Repo already cloned — pulling latest"
-  sudo -u "$APP_USER" git -C "$APP_DIR" pull
-else
-  sudo -u "$APP_USER" git clone "$REPO_URL" "$APP_DIR"
-  info "Repo cloned to $APP_DIR"
-fi
+section "Remote setup"
+ssh "$TARGET" bash -s -- "$APP_DIR" <<'REMOTE_SETUP'
+set -euo pipefail
+APP_DIR="$1"
+mkdir -p "$APP_DIR/data" "$APP_DIR/certs"
 
-section "Python virtual environment"
 if [[ ! -d "$APP_DIR/venv" ]]; then
-  sudo -u "$APP_USER" python3.12 -m venv "$APP_DIR/venv"
+  echo "Creating Python 3.12 venv..."
+  /usr/bin/python3.12 -m venv "$APP_DIR/venv"
 fi
-sudo -u "$APP_USER" "$APP_DIR/venv/bin/pip" install --upgrade pip -q
-sudo -u "$APP_USER" "$APP_DIR/venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q
-info "Dependencies installed"
+"$APP_DIR/venv/bin/pip" install --upgrade pip -q
+"$APP_DIR/venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q
+echo "Dependencies installed"
+REMOTE_SETUP
+info "Venv and dependencies ready"
 
-section "Data directory"
-mkdir -p "$APP_DIR/data"
-chown "$APP_USER:$APP_USER" "$APP_DIR/data"
-info "data/ directory ready"
-
-section "API credentials"
-ENV_FILE="$APP_DIR/.env"
-if [[ -f "$ENV_FILE" ]]; then
-  warn ".env already exists — skipping (edit $ENV_FILE manually if needed)"
+section "Credentials (.env)"
+if ssh "$TARGET" "test -f $APP_DIR/.env"; then
+  warn ".env already exists on $TARGET — leaving it untouched"
 else
-  cp "$APP_DIR/config/credentials.env" "$ENV_FILE"
-  chown "$APP_USER:$APP_USER" "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-
   echo ""
-  echo "Enter your API keys (press Enter to skip and fill in later):"
+  echo "Enter API keys for the new install (blank = leave unset, edit .env manually later):"
   echo ""
-
   read -rp "  ANTHROPIC_API_KEY:    " ANT_KEY
   read -rp "  ALPACA_API_KEY:       " ALP_KEY
   read -rp "  ALPACA_SECRET_KEY:    " ALP_SEC
+  read -rp "  ALPACA_BASE_URL [https://paper-api.alpaca.markets]: " ALP_URL
+  ALP_URL="${ALP_URL:-https://paper-api.alpaca.markets}"
   read -rp "  FINNHUB_API_KEY:      " FIN_KEY
   read -rp "  NEWSAPI_API_KEY:      " NEWS_KEY
-  read -rp "  PORT [$PORT]:         " CUSTOM_PORT
-  CUSTOM_PORT="${CUSTOM_PORT:-$PORT}"
+  read -rsp "  DASHBOARD_PASSWORD:   " DASH_PW; echo ""
+  SESSION_KEY=$(ssh "$TARGET" "python3 -c \"import secrets; print(secrets.token_hex(32))\"")
 
-  [[ -n "$ANT_KEY" ]]  && sed -i "s|ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=$ANT_KEY|" "$ENV_FILE"
-  [[ -n "$ALP_KEY" ]]  && sed -i "s|ALPACA_API_KEY=.*|ALPACA_API_KEY=$ALP_KEY|" "$ENV_FILE"
-  [[ -n "$ALP_SEC" ]]  && sed -i "s|ALPACA_SECRET_KEY=.*|ALPACA_SECRET_KEY=$ALP_SEC|" "$ENV_FILE"
-  [[ -n "$FIN_KEY" ]]  && sed -i "s|FINNHUB_API_KEY=.*|FINNHUB_API_KEY=$FIN_KEY|" "$ENV_FILE"
-  [[ -n "$NEWS_KEY" ]] && sed -i "s|NEWSAPI_API_KEY=.*|NEWSAPI_API_KEY=$NEWS_KEY|" "$ENV_FILE"
-  echo "PORT=$CUSTOM_PORT" >> "$ENV_FILE"
-  PORT="$CUSTOM_PORT"
-
-  info ".env created at $ENV_FILE"
+  ssh "$TARGET" "cat > $APP_DIR/.env << EOF
+ANTHROPIC_API_KEY=$ANT_KEY
+ALPACA_API_KEY=$ALP_KEY
+ALPACA_SECRET_KEY=$ALP_SEC
+ALPACA_BASE_URL=$ALP_URL
+FINNHUB_API_KEY=$FIN_KEY
+NEWSAPI_API_KEY=$NEWS_KEY
+DASHBOARD_PASSWORD=$DASH_PW
+SESSION_SECRET_KEY=$SESSION_KEY
+SSL_CERTFILE=$APP_DIR/certs/cert.pem
+SSL_KEYFILE=$APP_DIR/certs/key.pem
+EOF
+chmod 600 $APP_DIR/.env"
+  info ".env created on $TARGET"
 fi
 
+section "Pick a port"
+if [[ -n "$REQUESTED_PORT" ]]; then
+  PORT="$REQUESTED_PORT"
+else
+  # Start at 8080 (matches this project family's own convention: AITrading=8080,
+  # AICryptoTrading=8081) and walk up until we find one nothing is listening on.
+  PORT=8080
+  while ssh "$TARGET" "ss -tlnp 2>/dev/null | grep -q \":$PORT \""; do
+    PORT=$((PORT + 1))
+  done
+  warn "No port given — auto-selected $PORT (first free port from 8080). Pass a port explicitly to override."
+fi
+info "Using port $PORT"
+
+section "Tailscale HTTPS certificate"
+ssh "$TARGET" "tailscale cert --cert-file $APP_DIR/certs/cert.pem --key-file $APP_DIR/certs/key.pem $TS_HOSTNAME && chmod 600 $APP_DIR/certs/key.pem"
+info "Certificate issued for $TS_HOSTNAME"
+
 section "Systemd service"
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+ssh "$TARGET" "cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
 [Unit]
-Description=AITrading — AI Stock Research & Trading
-After=network-online.target
-Wants=network-online.target
+Description=Doug's AIShortTrading dashboard and trading engine
+After=network.target
 
 [Service]
 Type=simple
-User=${APP_USER}
-WorkingDirectory=${APP_DIR}
-Environment=PATH=${APP_DIR}/venv/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=${APP_DIR}/venv/bin/python start.py --mode web
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=${SERVICE_NAME}
+WorkingDirectory=$APP_DIR
+ExecStart=$APP_DIR/venv/bin/python3 -m uvicorn web.app:app --host 0.0.0.0 --port $PORT --ssl-certfile $APP_DIR/certs/cert.pem --ssl-keyfile $APP_DIR/certs/key.pem
+EnvironmentFile=$APP_DIR/.env
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
 systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
+systemctl enable ${SERVICE_NAME}"
 info "Systemd service installed and enabled"
 
-section "Firewall (ufw)"
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow ssh           # Always keep SSH open
-ufw allow "$PORT/tcp"   # Dashboard — restrict to your IP after setup if desired
-ufw --force enable
-info "Firewall enabled — SSH + port $PORT open"
-
-section "Fail2ban (SSH brute-force protection)"
-systemctl enable fail2ban
-systemctl start fail2ban
-info "Fail2ban active"
-
-section "SQLite backup cron"
-BACKUP_SCRIPT="/opt/aitrading-backup.sh"
-cat > "$BACKUP_SCRIPT" <<'BKUP'
+section "Certificate auto-renewal"
+ssh "$TARGET" "cat > $APP_DIR/renew_cert.sh << EOF
 #!/bin/bash
-SRC="/opt/aitrading/data/aitrading.db"
-DST="/opt/aitrading/data/backups/aitrading-$(date +%Y%m%d).db"
-mkdir -p /opt/aitrading/data/backups
-sqlite3 "$SRC" ".backup '$DST'"
-# Keep last 14 days
-find /opt/aitrading/data/backups -name "*.db" -mtime +14 -delete
-BKUP
-chmod +x "$BACKUP_SCRIPT"
-chown "$APP_USER:$APP_USER" "$BACKUP_SCRIPT"
-# Run at 8 PM ET (midnight UTC) on weekdays
-(crontab -l 2>/dev/null; echo "0 0 * * 1-5 $BACKUP_SCRIPT") | crontab -
-info "Daily SQLite backup configured (data/backups/)"
-
-section "Log rotation"
-cat > "/etc/logrotate.d/$SERVICE_NAME" <<EOF
-/var/log/journal/*${SERVICE_NAME}* {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-}
+# Renews the Tailscale HTTPS cert and restarts ${SERVICE_NAME} to pick it up.
+# Scheduled for Sunday 07:15 UTC (~3 AM ET) -- always market-closed, safe to
+# restart unconditionally. Cert is valid ~90 days; weekly renewal gives a
+# large safety margin.
+set -e
+tailscale cert --cert-file $APP_DIR/certs/cert.pem --key-file $APP_DIR/certs/key.pem $TS_HOSTNAME
+chmod 600 $APP_DIR/certs/key.pem
+systemctl restart ${SERVICE_NAME}
 EOF
-info "Log rotation configured"
+chmod +x $APP_DIR/renew_cert.sh
+(crontab -l 2>/dev/null | grep -v ${SERVICE_NAME}_cert_renew; echo \"15 7 * * 0 $APP_DIR/renew_cert.sh >> /var/log/${SERVICE_NAME}_cert_renew.log 2>&1\") | crontab -"
+info "Weekly cert renewal scheduled (Sunday 07:15 UTC)"
 
-section "Start AITrading"
-systemctl start "$SERVICE_NAME"
-sleep 3
-if systemctl is-active --quiet "$SERVICE_NAME"; then
-  info "AITrading is RUNNING"
+section "VERSION file"
+ssh "$TARGET" "cat $APP_DIR/VERSION 2>/dev/null || echo 'v0.0.0' > $APP_DIR/VERSION"
+
+section "Start the service"
+ssh "$TARGET" "systemctl restart ${SERVICE_NAME}"
+sleep 5
+if ssh "$TARGET" "systemctl is-active --quiet ${SERVICE_NAME}"; then
+  info "${SERVICE_NAME} is RUNNING"
 else
-  warn "Service did not start — check logs: journalctl -u $SERVICE_NAME -f"
+  warn "Service did not come up — check logs: ssh $TARGET journalctl -u ${SERVICE_NAME} -f"
 fi
-
-SERVER_IP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}  AITrading deployed successfully!${NC}"
+echo -e "${GREEN}  AIShortTrading deployed${NC}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo "  Dashboard:    http://${SERVER_IP}:${PORT}"
-echo "  App dir:      $APP_DIR"
-echo "  Credentials:  $ENV_FILE"
-echo "  Logs:         journalctl -u $SERVICE_NAME -f"
-echo "  Stop:         systemctl stop $SERVICE_NAME"
-echo "  Restart:      systemctl restart $SERVICE_NAME"
+echo "  Dashboard:    https://${TS_HOSTNAME}:${PORT}/"
+echo "  App dir:      $APP_DIR (on $TARGET)"
+echo "  Credentials:  $APP_DIR/.env (on $TARGET)"
+echo "  Logs:         ssh $TARGET journalctl -u ${SERVICE_NAME} -f"
+echo "  Restart:      ssh $TARGET systemctl restart ${SERVICE_NAME}"
 echo ""
-echo "  SECURE REMOTE ACCESS (recommended):"
-echo "  SSH tunnel:   ssh -L ${PORT}:localhost:${PORT} ${APP_USER}@${SERVER_IP}"
-echo "  Then open:    http://localhost:${PORT}"
-echo ""
-echo "  RESTRICT DASHBOARD TO YOUR IP (optional, recommended for live trading):"
-echo "  ufw delete allow ${PORT}/tcp"
-echo "  ufw allow from YOUR.HOME.IP to any port ${PORT}"
-echo ""
-if grep -q "your-key-here\|change-me\|placeholder" "$ENV_FILE" 2>/dev/null; then
-  warn "Some API keys are not set — edit $ENV_FILE then: systemctl restart $SERVICE_NAME"
-fi
+echo "  To ship a later code change, either re-run this script (it will rsync"
+echo "  fresh code and skip the venv/.env/cert/systemd steps that already"
+echo "  exist), or cut a release (scripts/cut_release.sh) and use the"
+echo "  dashboard's own Apply Update button, per this project's normal workflow."

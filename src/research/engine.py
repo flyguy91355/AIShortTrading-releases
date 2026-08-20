@@ -823,29 +823,34 @@ Respond with ONLY a JSON object:
         if not self.client:
             return None
         prompt = f"""\
+This system exclusively opens SHORT positions — "still a good buy" below means "still
+a good short."
+
 STOCK: {ticker} — {company_name}
-Original thesis: {thesis}
+Original short thesis: {thesis}
 Current price: ${price:.2f}
 Fair value estimate: ${fair_value_estimate:.2f}
-Stop-loss level: ${stop_loss:.2f}
+Stop-loss level (above entry): ${stop_loss:.2f}
 Computed reward/risk ratio: {rr:.2f} (this stock's own required minimum is
 {required_rr:.2f}, conviction {conviction_score}/10)
 
 This candidate's reward/risk ratio has risen above its own required minimum. That can
-mean the stock has genuinely become a better value, but it can also simply mean price
-has kept falling toward the stop-loss level, which mechanically inflates this ratio
-(a bigger gap to fair value, a smaller gap to the stop) without any real improvement
-in the setup.
+mean the stock has genuinely become MORE overvalued (a better short), but it can also
+simply mean price has kept RISING toward the stop-loss level, which mechanically
+inflates this ratio (a bigger gap down to fair value, a smaller gap up to the stop)
+without any real improvement in the setup.
 
-Judge whether this is still a genuine, worthwhile buying opportunity right now, or
-whether the elevated ratio reflects an overextended or deteriorating situation that's
-no longer a good buy. Weigh whether the original thesis still holds and whether the
-price action looks like continued decline versus a real recovery.
+Judge whether this is still a genuine, worthwhile short opportunity right now, or
+whether the elevated ratio reflects an overextended situation (price has run up close
+to the stop, real squeeze risk) that's no longer a good short. Weigh whether the
+original short thesis still holds and whether the price action looks like continued
+genuine overvaluation versus the stock simply approaching the stop before it's likely
+to reverse.
 
 Respond with ONLY a JSON object:
 {{"still_good_buy": true/false, "reasoning": "<a detailed 2-4 sentence explanation --
 reference the real numbers above (price, fair value, stop, R/R) and the thesis
-specifically, the same way you would explain a real investing decision to someone
+specifically, the same way you would explain a real short-selling decision to someone
 reading it, not a generic one-liner>"}}
 """
         model = self.config.get("research", {}).get("model_dip_entry", "claude-haiku-4-5")
