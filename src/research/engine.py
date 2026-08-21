@@ -785,6 +785,99 @@ Respond with ONLY a JSON object:
             logger.warning("%s: dip-entry recommendation failed: %s", ticker, e)
             return None
 
+    async def explain_buy_decision(
+        self, ticker: str, company_name: str, entry_price: float, stop_loss: float,
+        take_profit_targets: list[float], fair_value_estimate: float | None,
+        conviction: int | None, rr: float | None, required_rr: float | None,
+        opened_at_days_ago: float | None,
+    ) -> dict | None:
+        """Retroactive backfill for "Why AI Shorted This" (2026-08-21, same feature as
+        AITrading's own -- see that project's CLAUDE_HISTORY.md 2026-08-21 entry for the
+        full design/incident, and its own explain_buy_decision docstring for the
+        original design this is ported from). Only used for a position opened BEFORE
+        Position.buy_thesis/buy_reasoning existed to capture the real decision
+        automatically -- see scripts/backfill_buy_rationale.py, the sole caller. A
+        genuinely new short never calls this; it gets the real, original thesis/
+        reasoning/R/R for free from the exact analysis that triggered it
+        (OrderManager._execute_buy).
+
+        This is necessarily a RECONSTRUCTION, not the original reasoning verbatim (that
+        moment is gone) -- the prompt is explicit about this and grounds Claude in the
+        real, immutable trade parameters (entry, stop, targets, fair value, conviction,
+        the exact R/R math) rather than asking it to invent a narrative from nothing.
+        Returns None on any failure (no API key, malformed response, API error) -- the
+        backfill script simply skips that position and leaves it blank rather than
+        fabricating something, same AI Data Integrity principle as every other real
+        trading figure in this codebase. Uses model_dip_entry (a one-time, non-live-
+        trade-decision utility call, same class of usage that setting already covers).
+
+        Short economics (2026-08-19): stop_loss sits ABOVE entry_price (risk is the
+        distance up to the stop) and fair_value_estimate sits BELOW entry_price (reward
+        is the distance down to where the stock is expected to fall) -- the inverse of
+        AITrading's own long-only shape."""
+        if not self.client:
+            return None
+        risk = stop_loss - entry_price
+        rr_line = ""
+        if rr is not None and required_rr is not None:
+            rr_line = (f"\nRisk/reward at open: {rr:.2f} against a required {required_rr:.2f} "
+                       f"for this conviction level (this is what actually allowed the short -- "
+                       f"reward is the distance from entry ${entry_price:.2f} down to the fair "
+                       f"value estimate below; risk is the distance from entry up to the stop "
+                       f"${stop_loss:.2f}, ${risk:.2f} away).")
+        fv_line = f"\nFair value estimate at open: ${fair_value_estimate:.2f}" if fair_value_estimate else ""
+        conv_line = f"\nConviction score: {conviction}/10" if conviction is not None else ""
+        age_line = (f"\nThis position was opened approximately {opened_at_days_ago:.0f} day(s) ago."
+                    if opened_at_days_ago is not None else "")
+        targets_str = ", ".join(f"${t:.2f}" for t in take_profit_targets) if take_profit_targets else "none recorded"
+
+        prompt = f"""\
+You are reconstructing the investment case for a real SHORT this system already opened, for a
+"Why AI Shorted This" explanation shown to the account owner. The original real-time reasoning
+text from the moment the short was opened was not captured for this specific position (it
+predates that tracking), so you're rebuilding a faithful, well-reasoned explanation from the
+real, immutable trade parameters below -- not inventing a story disconnected from them.
+
+STOCK: {ticker} — {company_name}
+Entry (short) price: ${entry_price:.2f}
+Stop loss (buy-to-cover above entry): ${stop_loss:.2f}
+Take-profit targets (buy-to-cover below entry): {targets_str}{fv_line}{conv_line}{rr_line}{age_line}
+
+Write a genuine, comprehensive walk-through of the likely short thesis: what about this
+company's fundamentals and technical setup would make it a short candidate (overvaluation,
+deteriorating fundamentals, a broken technical setup, etc.), how the risk/reward math above
+specifically cleared this system's gate, and what the conviction level implies about how
+strong the case was. Be specific and grounded in the real numbers given -- don't write generic
+boilerplate that could apply to any stock. This should read like a real analyst's reasoning,
+several sentences of substance, not a one-line summary.
+
+Respond with ONLY a JSON object:
+{{"thesis": "<2-3 sentence core short thesis>",
+  "reasoning": "<4-6 sentences of detailed reasoning covering fundamentals/technicals, why the
+  R/R math worked, and what the conviction level reflects>"}}
+"""
+        model = self.config.get("research", {}).get("model_dip_entry", "claude-haiku-4-5")
+        try:
+            response_text = await self._call_claude_with_retry(
+                model=model, max_tokens=500, messages=[{"role": "user", "content": prompt}],
+                max_retries=2,
+            )
+            text = response_text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]
+            text = text.rstrip()
+            if text.endswith("```"):
+                text = text[:-3].rstrip()
+            data = json.loads(text)
+            thesis = str(data.get("thesis", "")).strip()
+            reasoning = str(data.get("reasoning", "")).strip()
+            if not thesis and not reasoning:
+                return None
+            return {"thesis": thesis, "reasoning": reasoning}
+        except Exception as e:
+            logger.warning("%s: explain_buy_decision failed: %s", ticker, e)
+            return None
+
     async def recommend_on_deck_retention(
         self, ticker: str, company_name: str, thesis: str, price: float,
         fair_value_estimate: float, stop_loss: float, rr: float, required_rr: float,

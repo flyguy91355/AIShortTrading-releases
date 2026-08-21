@@ -1868,6 +1868,14 @@ class DashboardState:
                 "trade_id": pos.trade_id,
                 "t1_target_price": round(pos.t1_target_price, 2) if pos.t1_target_price is not None else None,
                 "t2_target_price": round(pos.t2_target_price, 2) if pos.t2_target_price is not None else None,
+                # "Why AI Shorted This" (2026-08-21) -- see Position's own field docstring.
+                "buy_thesis": pos.buy_thesis,
+                "buy_reasoning": pos.buy_reasoning,
+                "buy_conviction": pos.buy_conviction,
+                "buy_signal": pos.buy_signal,
+                "buy_rr": round(pos.buy_rr, 2) if pos.buy_rr is not None else None,
+                "buy_required_rr": round(pos.buy_required_rr, 2) if pos.buy_required_rr is not None else None,
+                "buy_fair_value": round(pos.buy_fair_value, 2) if pos.buy_fair_value is not None else None,
             }
             for pos in p.positions.values()
         ]
@@ -5800,8 +5808,9 @@ class DashboardState:
                                     or self.config["risk_management"].get("starting_position_pct", 3.0)),
                 position_size_dollars=position_size, shares=shares,
                 reasoning=f"On Deck Deploy — R/R recovered to {rr:.2f} with confirmed downtick",
-                research_report=None, generated_at=datetime.now(), should_execute=True,
+                research_report=report, generated_at=datetime.now(), should_execute=True,
                 sector=getattr(report, "sector", ""),
+                rr=rr, required_rr=min_rr,
             )
 
             try:
