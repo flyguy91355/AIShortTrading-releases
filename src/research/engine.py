@@ -110,6 +110,14 @@ class ResearchReport:
     fair_value_estimate: float = 0.0
     margin_of_safety_pct: float = 0.0
     business_summary: str = ""
+    # A specific, concrete condition Claude thinks would make this a better SHORT
+    # opportunity right now (2026-08-21, same feature as AITrading's own -- see that
+    # project's CLAUDE_HISTORY.md 2026-08-21 "Analysis History" entry for the full
+    # design). Empty string when no such condition applies. Persisted to
+    # analysis_history alongside every other real analysis and fed back into the next
+    # analysis of the same ticker, so a stated "wait for X" isn't lost the instant this
+    # report is overwritten by the next one.
+    watch_condition: str = ""
 
 
 @dataclass
@@ -337,6 +345,7 @@ IMPORTANT RULES:
 - If the data is insufficient or unclear, recommend NO ACTION.
 - Every numeric field you output (entry_price, stop_loss, take_profit_targets) must be used consistently everywhere else in your response, including inside reasoning — if you cite risk/reward math or a specific target price in reasoning, it must match the actual entry_price/stop_loss/take_profit_targets values you output, and "first target" must mean take_profit_targets[0], not a later one.
 - If a LONG-TERM TREND section is present below, weigh it explicitly: judge whether the current setup looks like a genuine breakdown/overvaluation versus the stock simply returning to a level it has already bounced from before.
+- If a PRIOR ANALYSIS HISTORY section is present below, use it: judge whether any previously-stated watch condition has since been met or invalidated, and let the arc across those past calls inform how you read the current setup — not just today's numbers in isolation.
 
 STOCK: {ticker} — {company_name}
 CURRENT PRICE: ${current_price:.2f}
@@ -355,7 +364,7 @@ CURRENT PRICE: ${current_price:.2f}
 
 ── TECHNICAL CONTEXT ──
 {technical_summary}
-{market_context_section}{long_term_trend_section}{trade_history_section}{user_note_section}
+{market_context_section}{long_term_trend_section}{analysis_history_section}{trade_history_section}{user_note_section}
 Based on all of the above, provide your analysis as JSON with these exact fields:
 {{
     "conviction_score": <1-10, one decimal place, e.g. 7.3>,
@@ -371,7 +380,8 @@ Based on all of the above, provide your analysis as JSON with these exact fields
     "time_horizon": "<days|weeks|months>",
     "reasoning": "<detailed reasoning connecting all research dimensions>",
     "fair_value_estimate": <quick intrinsic value estimate as a number>,
-    "margin_of_safety_pct": <percentage the CURRENT PRICE sits ABOVE fair value — how overvalued this looks, i.e. how much downside a short has if price reverts to fair value; negative if the stock still looks UNDERVALUED (a poor short candidate)>
+    "margin_of_safety_pct": <percentage the CURRENT PRICE sits ABOVE fair value — how overvalued this looks, i.e. how much downside a short has if price reverts to fair value; negative if the stock still looks UNDERVALUED (a poor short candidate)>,
+    "watch_condition": "<a specific, concrete condition that would make this a better SHORT opportunity right now, e.g. a price level to wait for or an event to pass — empty string if the current setup needs no such condition>"
 }}
 
 Respond with ONLY the JSON object, no other text.
@@ -463,6 +473,27 @@ def _market_cap_tier_label(market_cap: float) -> str:
     return "small-cap"
 
 
+def _build_analysis_history_section(analysis_history_summary: str) -> str:
+    """Wraps a non-empty analysis-history summary in a clearly-labeled prompt section
+    (2026-08-21, same feature as AITrading's own -- see that project's
+    CLAUDE_HISTORY.md 2026-08-21 "Analysis History" entry for the full design). Unlike
+    trade_history_section's "minor, supplementary" framing, this is deliberately framed
+    as directly relevant to entry timing. Returns an empty string when there's no
+    history yet (a ticker's first-ever analysis), so ANALYSIS_PROMPT renders
+    byte-for-byte unchanged for any caller that doesn't pass one -- in particular, the
+    full daily universe scan never passes one, same cost/relevance-scoped exclusion
+    precedent as trade_history_section; this is wired instead into the paths that
+    actually re-examine a RECURRING candidate -- the promotion attempt, the On Deck
+    backfill re-check, and the On Deck persist-check re-vet."""
+    if not analysis_history_summary:
+        return ""
+    return (
+        "\n── PRIOR ANALYSIS HISTORY ON THIS TICKER (chronological — judge whether any "
+        "previously-stated watch condition has since been met or invalidated) ──\n"
+        f"{analysis_history_summary}\n"
+    )
+
+
 def _build_trade_history_section(trade_history_summary: str) -> str:
     """Wraps a non-empty trade history summary in a clearly-labeled prompt section, framed
     as minor supplementary context so Claude weighs current fundamentals/technicals as the
@@ -521,6 +552,7 @@ class ResearchEngine:
     async def analyze_stock(
         self, ticker: str, trade_history_summary: str = "",
         user_note_summary: str = "", model: str | None = None,
+        analysis_history_summary: str = "",
     ) -> ResearchReport:
         logger.info("Starting research analysis for %s", ticker)
 
@@ -568,6 +600,7 @@ class ResearchEngine:
                 long_term_trend_summary,
                 user_note_summary,
                 model,
+                analysis_history_summary,
             )
         else:
             logger.warning("No ANTHROPIC_API_KEY — generating rule-based report for %s", ticker)
@@ -1247,6 +1280,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         long_term_trend_summary: str = "",
         user_note_summary: str = "",
         market_change_pct: float | None = None,
+        analysis_history_summary: str = "",
     ) -> str:
         """Shared by the sequential path (_claude_analysis) and the batch path
         (submit_analysis_batch) — both build the identical prompt from ANALYSIS_PROMPT,
@@ -1255,6 +1289,11 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         passes one (2026-07-23, deliberately excluded, see docs/superpowers/specs/
         2026-07-23-trade-history-context-design.md), so the batch path's prompt is
         byte-for-byte unchanged from before this feature existed.
+
+        analysis_history_summary (2026-08-21) similarly defaults to "" -- the full daily
+        universe scan never passes one; it's wired instead into the paths that
+        re-examine a RECURRING candidate. See _build_analysis_history_section's own
+        docstring.
 
         market_change_pct (2026-08-04) -- today's S&P 500 % change, see
         _build_market_context_section's docstring for the full "should the AI know if
@@ -1328,6 +1367,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             long_term_trend_section=_build_long_term_trend_section(long_term_trend_summary),
             user_note_section=_build_user_note_section(user_note_summary),
             market_context_section=_build_market_context_section(market_change_pct),
+            analysis_history_section=_build_analysis_history_section(analysis_history_summary),
             stop_tp_instructions=stop_tp_instructions,
         )
 
@@ -1413,6 +1453,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             reasoning=data.get("reasoning", ""),
             fair_value_estimate=float(data["fair_value_estimate"]) if data.get("fair_value_estimate") is not None else 0.0,
             margin_of_safety_pct=float(data["margin_of_safety_pct"]) if data.get("margin_of_safety_pct") is not None else 0.0,
+            watch_condition=str(data.get("watch_condition", "") or "").strip(),
         )
 
     def _fallback_report(self, ticker: str, company_name: str, current_price: float,
@@ -1449,13 +1490,14 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         long_term_trend_summary: str = "",
         user_note_summary: str = "",
         model: str | None = None,
+        analysis_history_summary: str = "",
     ) -> ResearchReport:
         market_change_pct = await self.market_data.get_market_change_pct()
         prompt = self._build_quick_scan_prompt(
             ticker, company_name, current_price, fundamental_summary,
             insider_summary, news_summary, competitive_summary, technical_summary,
             trade_history_summary, long_term_trend_summary, user_note_summary,
-            market_change_pct,
+            market_change_pct, analysis_history_summary,
         )
         try:
             response_text = await self._call_claude_with_retry(
@@ -1525,14 +1567,21 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             "long_term_trend_summary": format_long_term_trend_summary(long_term_trend),
         }
 
-    async def submit_analysis_batch(self, tickers: list[str]) -> tuple[str | None, dict[str, dict]]:
+    async def submit_analysis_batch(
+        self, tickers: list[str], analysis_history_summaries: dict[str, str] | None = None,
+    ) -> tuple[str | None, dict[str, dict]]:
         """Gather inputs for a chunk of tickers concurrently, build one Batch API request
         per ticker using the identical ANALYSIS_PROMPT the sequential path uses, and submit
         as a single Anthropic Batch API call. Returns (batch_id, inputs_by_ticker) — the
         inputs dict is needed later by fetch_batch_results() to reconstruct each
         ResearchReport, since the batch response doesn't echo back the summaries used to
         build the prompt. Tickers whose data-gathering fails are silently excluded from the
-        batch — they're skipped for this run (available again next pre-open), not fatal."""
+        batch — they're skipped for this run (available again next pre-open), not fatal.
+
+        analysis_history_summaries (2026-08-21, optional, keyed by ticker) lets a caller
+        that already pre-fetched per-ticker history pass it through -- the persist-check
+        re-vet passes one; the once-a-day full universe scan doesn't. Missing/omitted
+        entries default to "" (no section), never raise."""
         if not self.client:
             return None, {}
 
@@ -1567,6 +1616,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         # naturally dedupe this anyway, but fetching it once up front avoids even the
         # first-ticker's real network call being on this loop's critical path repeatedly.
         market_change_pct = await self.market_data.get_market_change_pct()
+        _history = analysis_history_summaries or {}
         requests = []
         for ticker, inp in inputs_by_ticker.items():
             prompt = self._build_quick_scan_prompt(
@@ -1575,6 +1625,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 inp["news_summary"], inp["competitive_summary"], inp["technical_summary"],
                 long_term_trend_summary=inp.get("long_term_trend_summary", ""),
                 market_change_pct=market_change_pct,
+                analysis_history_summary=_history.get(ticker, ""),
             )
             requests.append({
                 "custom_id": ticker,
