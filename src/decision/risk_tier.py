@@ -186,3 +186,17 @@ def apply_risk_tier_to_settings(
     for factor_key, dotkey in RISK_TIER_DOTKEYS.items():
         result[dotkey] = computed[factor_key]
     return result
+
+
+def restore_anchors_to_settings(coerced_values: dict, anchors: dict) -> dict:
+    """Restores the 11 real factor dotkeys to their anchor values, merged into a NEW
+    dict (the input is never mutated) -- used when risk_tier.mode switches from
+    "auto" to "manual". Per explicit owner direction, leaving auto mode must restore
+    the program's real original settings, never a hardcoded factory default; the
+    anchors ARE that original baseline (captured once, at the moment this program's
+    risk-tier feature was first seeded -- see compute_risk_tier_settings's own
+    docstring), so restoring to them is restoring the owner's own prior values."""
+    result = dict(coerced_values)
+    for factor_key, dotkey in RISK_TIER_DOTKEYS.items():
+        result[dotkey] = anchors[factor_key]
+    return result
