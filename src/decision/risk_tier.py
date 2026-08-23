@@ -90,32 +90,41 @@ def risk_tier_label(tier_value: float) -> str:
 
 
 _RISK_TIER_POSTURES = {
+    # 2026-08-23: adapted for short economics -- a price DECLINE is this system's
+    # own profit direction (the opposite of AITrading's long-only version this was
+    # first ported from), so "cover" replaces "exit," "decline"/"downside" replaces
+    # "upside" as the favorable direction, and a "rally"/"bounce" (not a
+    # "pullback") is the risk a wider stop should tolerate. See
+    # _build_market_context_section (src/research/engine.py) for the sibling fix
+    # this mirrors -- that one was correctly inverted when this feature was first
+    # ported; this text was missed at the time.
     "Low": (
         "Operate with a LOW risk tolerance right now. Prioritize capital "
-        "preservation over upside -- decline a marginal setup rather than stretch "
-        "for it, and favor an earlier, more conservative exit over riding a "
-        "position further."
+        "preservation over a short's potential reward -- decline a marginal setup "
+        "rather than stretch for it, and favor an earlier, more conservative cover "
+        "over riding a short position further."
     ),
     "Medium-Low": (
         "Operate with a MEDIUM-LOW risk tolerance right now. Lean toward "
-        "selectivity and caution, but a genuinely strong setup is still worth "
-        "taking."
+        "selectivity and caution, but a genuinely strong short setup is still "
+        "worth taking."
     ),
     "Medium": (
-        "Operate with a balanced, MEDIUM risk tolerance right now -- weigh upside "
-        "and downside evenly, neither reaching for marginal setups nor declining "
-        "solid ones out of excess caution."
+        "Operate with a balanced, MEDIUM risk tolerance right now -- weigh a "
+        "short's potential reward and its squeeze risk evenly, neither reaching "
+        "for marginal setups nor declining solid ones out of excess caution."
     ),
     "Medium-High": (
         "Operate with a MEDIUM-HIGH risk tolerance right now. Lean toward "
-        "capturing upside -- a solid (not just a perfect) setup is worth taking, "
-        "and a bit more room before cutting a loss is acceptable."
+        "capturing the short's downside potential -- a solid (not just a "
+        "perfect) setup is worth taking, and a bit more room before covering at "
+        "a loss is acceptable."
     ),
     "High": (
         "Operate with a HIGH risk tolerance right now. Greater risk tolerance is "
-        "acceptable -- don't let a merely-good setup pass waiting for a perfect "
-        "one, and give a position more room to work before treating a pullback as "
-        "a reason to exit."
+        "acceptable -- don't let a merely-good short setup pass waiting for a "
+        "perfect one, and give a short position more room to work (further "
+        "decline) before treating a bounce or rally as a reason to cover."
     ),
 }
 
