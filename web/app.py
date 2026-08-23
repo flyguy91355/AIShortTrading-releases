@@ -7890,7 +7890,10 @@ async def save_settings(payload: dict):
 
     if "risk_tier.value" in coerced_values:
         _risk_tier_anchors = state.config.get("risk_tier", {}).get("anchors", {})
-        coerced_values = apply_risk_tier_to_settings(coerced_values, _risk_tier_anchors)
+        _current_tier_value = state.config.get("risk_tier", {}).get("value")
+        coerced_values = apply_risk_tier_to_settings(
+            coerced_values, _risk_tier_anchors, current_tier_value=_current_tier_value,
+        )
         # The _rm_map resync block below reads directly from `payload`, not
         # `coerced_values` -- write the freshly tier-computed values back into
         # `payload` too so that block picks up the real numbers instead of whatever
