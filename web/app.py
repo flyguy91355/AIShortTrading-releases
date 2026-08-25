@@ -6488,11 +6488,56 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         in_flight: dict[asyncio.Task, float] = {}
 
         async def _sequential_fallback(chunk: list[str]) -> None:
+            """Checks self.paused/self.stopped/should_stop() before EVERY ticker (fixed
+            2026-08-25, ported from AITrading's own live incident the same day) -- unlike
+            _try_submit_next's own gate on pulling a NEW chunk, this loop previously had
+            no interrupt check of its own at all, so once it started it ground through
+            every remaining ticker in the chunk (up to ~100) regardless of a Pause/Stop
+            issued mid-run. Live-caught on AITrading: a real account-wide Anthropic
+            usage-limit lockout meant every single call in this loop was failing, but
+            /api/stop (which DOES correctly stop new chunks/batches from starting per
+            _try_submit_next below) had no effect on this already-running loop -- the
+            owner's explicit "stop the scan" request could only actually be honored by a
+            full service restart, which kills every in-flight asyncio task
+            unconditionally. This program hit the identical wall on its own manual scan
+            at the same time (shared ANTHROPIC_API_KEY), so the fix was ported here
+            proactively rather than waiting for it to recur independently. A mid-chunk
+            Pause/Stop now breaks out within one ticker instead of requiring a
+            restart to actually take effect."""
             _history = analysis_history_summaries or {}
             for ticker in chunk:
+                if self.paused or self.stopped or should_stop():
+                    logger.info(
+                        "Sequential fallback interrupted (paused/stopped) with %d "
+                        "ticker(s) still remaining in this chunk", len(chunk))
+                    return
                 try:
                     report = await self.research_engine.analyze_stock(
                         ticker, analysis_history_summary=_history.get(ticker, ""))
+                    if getattr(report, "is_account_locked", False):
+                        # A hard, account-wide Claude API lockout (2026-08-25, ported
+                        # from AITrading's own live incident the same day) -- every
+                        # remaining ticker in this run is guaranteed to fail identically,
+                        # so grinding through the rest wastes time for zero benefit.
+                        # Auto-pauses (not stops) so position_update_loop keeps
+                        # protecting held positions -- same halt severity /api/pause
+                        # already uses for "AI is unavailable right now" -- and reports
+                        # it plainly on the AI Research Engine log so it's never
+                        # mistaken for ordinary silence. Resuming (once the account
+                        # issue is actually resolved) is the same one-click Resume
+                        # button as any other pause.
+                        self.paused = True
+                        self._save_run_state()
+                        entry = self.add_ai_log(
+                            "SYSTEM", "SYSTEM",
+                            f"⚠ Claude API account lockout detected ({report.thesis}) — "
+                            "auto-paused to stop wasting scan time; held positions remain "
+                            "protected. Resolve the account issue, then click Resume.",
+                            "error",
+                        )
+                        await self.broadcast({"type": "ai_log", "entry": entry})
+                        await self.broadcast({"type": "run_status", "run_status": self.run_status()})
+                        return
                     await on_result(ticker, report)
                 except Exception as e:
                     logger.error("Sequential fallback failed for %s: %s", ticker, e)
