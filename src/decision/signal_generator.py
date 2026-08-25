@@ -78,6 +78,13 @@ class SignalGenerator:
         # state.config[...] directly rather than caching it in an instance variable.
 
     def _evaluate_report(self, report: ResearchReport) -> TradeSignal | None:
+        # AI Data Integrity guard (ported 2026-08-24 from AITrading, GitHub #80) -- every
+        # other real buy-decision call site checks is_fallback before treating a report as
+        # buy-eligible; this was the sole exception.
+        if getattr(report, "is_fallback", False):
+            logger.info("  %s REJECTED: fallback (non-AI) report", report.ticker)
+            return None
+
         min_conviction = self.config["research"]["min_conviction_score"]
         if report.conviction_score < min_conviction:
             logger.info("  %s REJECTED: conviction %d < %d", report.ticker, report.conviction_score, min_conviction)

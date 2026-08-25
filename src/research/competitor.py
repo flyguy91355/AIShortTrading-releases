@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import yfinance as yf
 
+from src.research.market_cap import market_cap_tier_label
+
 
 SECTOR_PEERS = {
     "AAPL": ["MSFT", "GOOGL", "SAMSUNG"],
@@ -72,17 +74,21 @@ class CompetitorAnalyzer:
         )
 
     def _assess_position(self, market_cap: float, info: dict) -> str:
-        if market_cap >= 1_000_000_000_000:
+        """Ported 2026-08-24 from AITrading, GitHub #82: used to hardcode its own,
+        independently-drifted set of bucket boundaries (mega-cap >= $1T here vs. >= $200B
+        in src/research/market_cap.py) despite that module's own docstring claiming the
+        two were kept in sync. Now derives its wording from the single shared tier
+        function so the boundaries genuinely can't drift apart again."""
+        tier = market_cap_tier_label(market_cap)
+        if tier == "mega-cap":
             return "dominant mega-cap leader"
-        if market_cap >= 200_000_000_000:
+        if tier == "large-cap":
             return "major large-cap player"
-        if market_cap >= 50_000_000_000:
-            return "established large-cap"
-        if market_cap >= 10_000_000_000:
+        if tier == "mid-cap":
             return "mid-cap contender"
-        if market_cap >= 2_000_000_000:
+        if tier == "small-cap":
             return "small-cap competitor"
-        return "micro/small-cap niche player"
+        return "unknown-size company"
 
     def _assess_moat(self, info: dict) -> tuple[str, float]:
         score = 5.0

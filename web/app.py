@@ -112,7 +112,7 @@ from src.execution.broker import OrderStatus
 from src.reporting.trade_logger import TradeLogger
 from src.utils.watchlist_manager import WatchlistManager
 from src.data.stock_universe import get_universe
-from src.analytics.composition_benchmark import weighted_daily_return
+from src.analytics.composition_benchmark import weighted_daily_return, is_usable_price
 from src.update.version import read_local_version, write_local_version, is_newer
 from src.update.release_client import fetch_latest_release, fetch_recent_releases
 from src.update.apply import extract_release_archive, copy_updatable_files, requirements_changed
@@ -147,13 +147,13 @@ def _get_or_init_account_genesis(today_str: str) -> str:
     real go-live date with zero manual configuration. `today_str` is passed in
     (rather than computed here) so this stays testable without mocking the clock."""
     try:
-        existing = _ACCOUNT_GENESIS_PATH.read_text().strip()
+        existing = _ACCOUNT_GENESIS_PATH.read_text(encoding="utf-8").strip()
         if existing:
             return existing
     except FileNotFoundError:
         pass
     _ACCOUNT_GENESIS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _ACCOUNT_GENESIS_PATH.write_text(today_str)
+    _ACCOUNT_GENESIS_PATH.write_text(today_str, encoding="utf-8")
     return today_str
 
 # The Watchlist-removal redesign (2026-07-17, see CLAUDE.md) completely replaced the
@@ -1491,7 +1491,25 @@ class DashboardState:
         self.cycle_count: int = 0
         self.scan_index: int = 0       # which stock in the 50 we're on
         self.next_cycle_at: str = ""
-        self.paused: bool = False
+        # Two independent halt severities (built 2026-08-25, ported from AITrading's
+        # own GitHub #78 fix, which itself ported AICryptoTrading's already-working
+        # feature), both persisted to data/run_state.json so a restart/Apply Update
+        # never silently loses either one:
+        #   paused=True  -- stops every AI-spend loop (position_monitor_loop,
+        #                    position_deep_dive_loop, auto_scan_loop, watchlist_rr_loop,
+        #                    near_miss_monitor_loop, the pre-open/midday batch paths).
+        #                    Zero Claude calls. position_update_loop keeps running --
+        #                    held positions stay fully protected (stop-loss/
+        #                    trailing-stop/protection-gap checks/exit-order sync).
+        #   stopped=True -- everything above PLUS position_update_loop itself stops.
+        #                    No broker-side management of any kind. Deliberately does
+        #                    NOT kill the process -- keeps the dashboard reachable so a
+        #                    Start System click brings everything back with no
+        #                    SSH/support needed.
+        self._run_state_path = "data/run_state.json"
+        self.paused: bool
+        self.stopped: bool
+        self.paused, self.stopped = self._load_run_state()
         # Concurrent On Deck promotion cash-reserve guard (fixed 2026-08-02, GitHub #44)
         # -- near_miss_monitor_loop can fire multiple _attempt_near_miss_promotion tasks
         # in the same tick with no shared lock, so each independently checked
@@ -1629,6 +1647,13 @@ class DashboardState:
         # freshness the way Day P/L does. Empty dict means "not computed yet"; the
         # frontend/get_portfolio_snapshot both treat that the same as zero trades.
         self._win_rate_cache: dict = {}
+        # Fingerprint for the cheap-skip below (2026-08-24, ported from AITrading
+        # GitHub #95) -- the last-seen MAX(id) of a SELL row in trade_history at the
+        # moment the win-rate cache was actually recomputed. -1 means "never
+        # computed yet" (no real trade_history id can ever be negative), so the very
+        # first call always does a real recompute regardless of whether any SELL
+        # rows exist.
+        self._win_rate_cache_last_sell_id: int = -1
         # AI-entry recommendation that actually triggered a near-miss promotion buy
         # (2026-07-20) — ticker -> {ai_entry_price, ai_entry_reasoning, recorded_at}.
         # Without this, the specific recommendation/reasoning that led to the buy
@@ -1805,6 +1830,31 @@ class DashboardState:
         self._log_db_path = db_path
         self._init_log_db()
         self.ai_log = self._load_log_from_db()
+
+    def _load_run_state(self) -> tuple[bool, bool]:
+        try:
+            data = json.loads(Path(self._run_state_path).read_text(encoding="utf-8"))
+            return bool(data.get("paused", False)), bool(data.get("stopped", False))
+        except Exception:
+            return False, False
+
+    def _save_run_state(self):
+        try:
+            Path(self._run_state_path).write_text(
+                json.dumps({"paused": self.paused, "stopped": self.stopped}), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.warning("Could not save run state: %s", e)
+
+    def run_status(self) -> str:
+        """Single source of truth for the 3-way UI state -- 'stopped' takes priority
+        over 'paused' since it's the stronger condition (see the paused/stopped
+        __init__ comment for exactly what each level gates)."""
+        if self.stopped:
+            return "stopped"
+        if self.paused:
+            return "paused"
+        return "running"
 
     def _init_log_db(self):
         import sqlite3 as _sqlite3
@@ -2050,7 +2100,27 @@ class DashboardState:
         reasoning as get_portfolio_health's existing split: a stat blending in trades
         decided by the pre-2026-07-17 Watchlist-based system (which no longer exists)
         isn't a fair read on how the current logic performs. All-time is kept alongside
-        it for the tile's popup detail view."""
+        it for the tile's popup detail view.
+
+        MAX(id) fingerprint skip (2026-08-24, ported from AITrading GitHub #95) -- this
+        runs every near_miss_monitor_loop tick (60s), including outside market hours
+        (see that loop's own docstring for why), but the real 2-query recompute below
+        is only ever worth paying for again once a genuinely new SELL row exists --
+        nothing about a closed trade's win/loss classification can change between two
+        ticks with no new sell in between. A cheap `SELECT MAX(id)` against
+        trade_history is real DB I/O too, but far cheaper than the full
+        trade_id-grouped query pair this skips."""
+        if not self.portfolio._db:
+            return
+        async with self.portfolio._db.execute(
+            "SELECT MAX(id) FROM trade_history WHERE action = 'SELL'"
+        ) as cur:
+            row = await cur.fetchone()
+        latest_sell_id = row[0] if row and row[0] is not None else 0
+        if latest_sell_id == self._win_rate_cache_last_sell_id and self._win_rate_cache:
+            return
+        self._win_rate_cache_last_sell_id = latest_sell_id
+
         current_arch_trades = await self._closed_trades_since(_CURRENT_ARCHITECTURE_START)
         all_time_trades = await self._closed_trades_since(self.live_account_start)
         closed_current_arch = len(current_arch_trades)
@@ -2320,11 +2390,17 @@ class DashboardState:
             "index": self.scan_index,
             "total": self.watchlist_manager.size(),
             "next_cycle": self.next_cycle_at,
-            "paused": self.paused,
+            "run_status": self.run_status(),
         }
 
     def _rank_position(self, ticker: str) -> float:
-        """Score a held position — lower score = weaker holding, better swap candidate."""
+        """Score a held position — lower score = weaker holding, better swap candidate.
+
+        Confirmed dead (2026-08-24, ported from AITrading GitHub #84): only called from
+        _try_rotation_swap, whose own sole call site is inside the already-dead
+        _buy_from_watchlist_by_price (see the "On Deck Buy Pipeline" dead-code list in
+        CLAUDE.md) -- left in place rather than deleted per this project's standing
+        precedent for superseded code."""
         pos = self.portfolio.positions.get(ticker)
         if not pos:
             return float("inf")
@@ -2335,7 +2411,12 @@ class DashboardState:
         return conviction + (pos.unrealized_pnl_pct / 10)
 
     async def _try_rotation_swap(self, new_candidate: dict, rotated_out: set | None = None) -> tuple[bool, float]:
-        """Sell weakest holding if new candidate scores higher. Returns (swapped, proceeds)."""
+        """Sell weakest holding if new candidate scores higher. Returns (swapped, proceeds).
+
+        Confirmed dead (2026-08-24, ported from AITrading GitHub #84): its sole real
+        call site is inside the already-dead _buy_from_watchlist_by_price (see the "On
+        Deck Buy Pipeline" dead-code list in CLAUDE.md) -- left in place rather than
+        deleted per this project's standing precedent for superseded code."""
         from src.decision.signal_generator import TradeSignal
         from src.research.engine import Signal as Sig
 
@@ -2556,6 +2637,15 @@ class DashboardState:
                 await self.broadcast({"type": "portfolio",
                                      "portfolio": self.get_portfolio_snapshot()})
 
+            # Gated on stopped only, NOT paused (built 2026-08-25, ported from
+            # AITrading's GitHub #78 fix, itself ported from AICryptoTrading's
+            # identical, already-working position_loop guard) -- position management
+            # (stop-loss/trailing-stop/protection-gap checks/exit-order sync) has zero
+            # AI cost and must keep running through an ordinary pause, per the
+            # paused/stopped __init__ design comment ("held positions stay fully
+            # protected" while paused). Only a full Stop halts it too.
+            if self.stopped:
+                continue
             if not self.broker_connected:
                 continue
             try:
@@ -3037,7 +3127,7 @@ class DashboardState:
         while True:
             interval = self.position_monitor_interval * 60
             await asyncio.sleep(interval)
-            if self.paused or not self._is_market_open():
+            if self.paused or self.stopped or not self._is_market_open():
                 continue
             if not self.portfolio.positions:
                 continue
@@ -3097,7 +3187,7 @@ class DashboardState:
         while True:
             interval_hours = self.config["research"].get("position_deep_dive_interval_hours", 3)
             await asyncio.sleep(max(1, interval_hours) * 3600)
-            if self.paused or not self._is_market_open():
+            if self.paused or self.stopped or not self._is_market_open():
                 continue
             if not self.config["research"].get("position_deep_dive_enabled", True):
                 continue
@@ -3648,7 +3738,7 @@ class DashboardState:
         while True:
             await self._update_holiday_flag()
 
-            if self.paused:
+            if self.paused or self.stopped:
                 await asyncio.sleep(5)
                 continue
 
@@ -4091,23 +4181,26 @@ class DashboardState:
         await self.broadcast({"type": "ai_log", "entry": entry})
 
     async def _rebuy_legacy_positions(self):
-        """Sell round-share (legacy) positions and immediately rebuy notionally to get T1/T2/T3."""
-        import alpaca_trade_api as tradeapi
+        """Sell round-share (legacy) positions and immediately rebuy notionally to get T1/T2/T3.
+
+        Routes through self.order_manager.broker (ported 2026-08-24 from AITrading,
+        GitHub #83) rather than constructing its own raw alpaca_trade_api.REST client
+        directly from env vars — the same real Alpaca connection every other order-
+        placement path in this codebase already uses, so this admin utility can't drift
+        from AlpacaBroker's own rate-limit retry / status mapping / client_order_id
+        handling the way a second, independent client construction risked."""
         from src.decision.signal_generator import TradeSignal
         from src.research.engine import Signal as Sig
+        from src.execution.broker import Order, OrderSide, OrderType
 
-        api = tradeapi.REST(
-            os.getenv("ALPACA_API_KEY"),
-            os.getenv("ALPACA_SECRET_KEY"),
-            os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
-        )
+        broker = self.order_manager.broker
 
         # Legacy = round share count (bought by qty, not notional)
-        all_positions = await asyncio.to_thread(api.list_positions)
+        all_positions = await broker.get_positions()
         legacy = [
-            (p.symbol, float(p.qty), float(p.market_value))
+            (p["ticker"], p["shares"], p["market_value"])
             for p in all_positions
-            if float(p.qty) == int(float(p.qty))
+            if p["shares"] == int(p["shares"])
         ]
 
         if not legacy:
@@ -4138,21 +4231,20 @@ class DashboardState:
 
             # Cancel existing orders for this ticker
             try:
-                open_orders = await asyncio.to_thread(api.list_orders, status="open")
+                open_orders = await broker.get_open_orders()
                 for o in open_orders:
-                    if o.symbol == ticker:
-                        await asyncio.to_thread(api.cancel_order, o.id)
+                    if o["ticker"] == ticker:
+                        await broker.cancel_order(o["order_id"])
                         await asyncio.sleep(0.5)
             except Exception as e:
                 logger.warning("Cancel orders failed for %s: %s", ticker, e)
 
             # Sell all shares at market
             try:
-                await asyncio.to_thread(
-                    api.submit_order,
-                    symbol=ticker, qty=int(qty), side="sell",
-                    type="market", time_in_force="day",
-                )
+                await broker.submit_order(Order(
+                    ticker=ticker, side=OrderSide.SELL, order_type=OrderType.MARKET,
+                    quantity=int(qty),
+                ))
                 entry = self.add_ai_log(ticker, "REBUY",
                     f"Sold {int(qty)} share(s) at market — waiting for fill", "sell")
                 await self.broadcast({"type": "ai_log", "entry": entry})
@@ -4175,16 +4267,17 @@ class DashboardState:
 
             # Re-sync cash from Alpaca so the rebuy check uses the actual post-sell balance
             try:
-                account = await asyncio.to_thread(api.get_account)
-                self.portfolio.cash = float(account.cash)
+                account = await broker.get_account()
+                self.portfolio.cash = account.cash
                 await self.portfolio._save_state()
             except Exception as _e:
                 logger.warning("Cash re-sync after rebuy sell of %s failed: %s", ticker, _e)
 
             # Get current price for stop/TP levels
             try:
-                latest = await asyncio.to_thread(api.get_latest_trade, ticker)
-                current_price = float(latest.price)
+                current_price = await broker.get_quote(ticker)
+                if current_price is None:
+                    current_price = mkt_value / qty
             except Exception:
                 current_price = mkt_value / qty
 
@@ -4875,7 +4968,7 @@ class DashboardState:
         while True:
             await asyncio.sleep(60)
             try:
-                if self.paused or not self._is_market_open():
+                if self.paused or self.stopped or not self._is_market_open():
                     continue
                 tickers = [s["ticker"] for s in self.watchlist_manager.get_active()]
                 if not tickers:
@@ -4920,14 +5013,28 @@ class DashboardState:
         if not self.on_deck_blocked:
             return
         breakout_pct = self.config["research"].get("on_deck_block_breakout_pct", 2.0)
+        blocked_to_check: list[tuple[str, float]] = []
         for ticker, raw in list(self.on_deck_blocked.items()):
             entry = _normalize_block_entry(raw)
             ref_peak = entry["ref_peak"]
             if ref_peak is None:
                 continue
+            blocked_to_check.append((ticker, ref_peak))
+
+        # Concurrent quote prefetch (2026-08-24, ported from AITrading GitHub #94) --
+        # was a sequential await per blocked ticker; each ticker's quote is
+        # independent of every other's, so this fetches them all at once instead.
+        async def _fetch_block_quote(t: str):
             try:
-                quote = await self.market_data.get_quote(ticker)
+                return await self.market_data.get_quote(t)
             except Exception:
+                return None
+
+        block_quotes = await asyncio.gather(
+            *(_fetch_block_quote(t) for t, _ in blocked_to_check))
+
+        for (ticker, ref_peak), quote in zip(blocked_to_check, block_quotes):
+            if quote is None:
                 continue
             if _price_clears_block_breakout(quote.price, ref_peak, breakout_pct):
                 self.on_deck_blocked.pop(ticker, None)
@@ -4937,6 +5044,22 @@ class DashboardState:
                     f"down below its stale-rally reference low (${ref_peak:.2f}) by "
                     f"{breakout_pct:.1f}%+", "success")
                 await self.broadcast({"type": "ai_log", "entry": log_entry})
+
+    def _evict_on_deck_automatic(self, ticker: str, message: str) -> None:
+        """Shared eviction bookkeeping for a mechanical (no-AI-call) On Deck removal:
+        pop + mark_universe_reject + log + broadcast. Extracted (ported 2026-08-24 from
+        AITrading, GitHub #91) from near_miss_monitor_loop's to_evict_rr_floor/
+        to_evict_above_gate handling below, which duplicated this exact 4-step
+        sequence. Deliberately does NOT persist the on_deck_cache save -- each caller
+        still does that once per batch, after its own loop, since it only needs to
+        happen once regardless of how many tickers were evicted in that pass (not once
+        per evicted ticker). to_evict_stale is a genuinely different mechanism (routes
+        through remove_on_deck_candidate, which supports a temporary block + note) and
+        stays its own, separate loop -- not folded into this helper."""
+        self.near_miss_candidates.pop(ticker, None)
+        self._mark_universe_reject(ticker)
+        entry = self.add_ai_log(ticker, "ON_DECK", message, "warning")
+        asyncio.create_task(self.broadcast({"type": "ai_log", "entry": entry}))
 
     async def near_miss_monitor_loop(self):
         """Free (yfinance, no Claude) price monitor for near-miss candidates — BUY-signal,
@@ -5010,7 +5133,7 @@ class DashboardState:
                 # open right now either.
                 await self._process_sell_analysis_queue()
 
-                if self.paused or not self._is_market_open():
+                if self.paused or self.stopped or not self._is_market_open():
                     continue
 
                 # Free price-based On Deck re-eligibility check (2026-07-29) -- runs before
@@ -5046,16 +5169,36 @@ class DashboardState:
                 to_evict_rr_floor: list[tuple[str, float, float]] = []
                 to_evict_above_gate: list[tuple[str, float, float, str]] = []
 
+                candidates_to_check: list[tuple[str, dict]] = []
                 for ticker, nm in list(self.near_miss_candidates.items()):
                     if ticker in self.portfolio.positions:
                         self.near_miss_candidates.pop(ticker, None)
                         continue
+                    candidates_to_check.append((ticker, nm))
+
+                # Concurrent quote prefetch (2026-08-24, ported from AITrading GitHub
+                # #94) -- was a plain sequential `await self.market_data.get_quote(ticker)`
+                # inside the loop below, one real yfinance/Finnhub round-trip per
+                # candidate per 60s tick; each ticker's quote is fully independent of
+                # every other's, so N candidates serialized N fetches for no reason.
+                # Fetched all at once here instead; every other per-ticker step in the
+                # loop below (state mutation, the cooldown-gated real AI above-gate
+                # re-judgment call) stays exactly as before -- sequential, per ticker --
+                # only the quote fetch itself moved out.
+                async def _fetch_nm_quote(t: str):
                     try:
-                        quote = await self.market_data.get_quote(ticker)
-                        price = quote.price
+                        return await self.market_data.get_quote(t)
                     except Exception as e:
-                        logger.debug("%s: near-miss price fetch failed: %s", ticker, e)
+                        logger.debug("%s: near-miss price fetch failed: %s", t, e)
+                        return None
+
+                nm_quotes = await asyncio.gather(
+                    *(_fetch_nm_quote(t) for t, _ in candidates_to_check))
+
+                for (ticker, nm), quote in zip(candidates_to_check, nm_quotes):
+                    if quote is None:
                         continue
+                    price = quote.price
                     if price <= 0:
                         continue
 
@@ -5387,13 +5530,10 @@ class DashboardState:
                 # exactly (same wording, same "warning" level) so the two are indistinguishable
                 # in the log except for how quickly each one can catch a given candidate.
                 for ticker, rr_val, required_rr in to_evict_rr_floor:
-                    self.near_miss_candidates.pop(ticker, None)
-                    self._mark_universe_reject(ticker)
-                    entry = self.add_ai_log(ticker, "ON_DECK",
+                    self._evict_on_deck_automatic(ticker,
                         f"Removed from On Deck — R/R {rr_val:.2f} below min R/R floor "
                         f"({required_rr + floor_margin:.2f}, its own gate {required_rr:.2f} "
-                        f"+ {floor_margin:.2f} margin)", "warning")
-                    asyncio.create_task(self.broadcast({"type": "ai_log", "entry": entry}))
+                        f"+ {floor_margin:.2f} margin)")
                 if to_evict_rr_floor:
                     asyncio.create_task(
                         asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
@@ -5404,13 +5544,10 @@ class DashboardState:
                 # from it in this same pass. Mirrors the persist-check sweep's own above-gate
                 # eviction message exactly (same wording, same "warning" level).
                 for ticker, rr_val, required_rr, reasoning in to_evict_above_gate:
-                    self.near_miss_candidates.pop(ticker, None)
-                    self._mark_universe_reject(ticker)
-                    entry = self.add_ai_log(ticker, "ON_DECK",
+                    self._evict_on_deck_automatic(ticker,
                         f"Removed from On Deck — R/R {rr_val:.2f} above its own gate "
                         f"({required_rr:.2f}), AI judged it's no longer a good short: "
-                        f"{reasoning}", "warning")
-                    asyncio.create_task(self.broadcast({"type": "ai_log", "entry": entry}))
+                        f"{reasoning}")
                 if to_evict_above_gate:
                     asyncio.create_task(
                         asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
@@ -5594,6 +5731,22 @@ class DashboardState:
         asyncio.create_task(
             self.broadcast({"type": "promotion_attempt", "entry": entry}))
 
+    def _cash_reserve_insufficient(self, cash: float, position_size: float, reserved: float = 0.0) -> bool:
+        """True if cash - reserved - position_size would fall below the configured
+        cash reserve floor (risk_management.min_cash_reserve_pct of total portfolio
+        value). Extracted (ported 2026-08-24 from AITrading, GitHub #92) from
+        _attempt_near_miss_promotion's 2 real reserve checks -- the cheap pre-check
+        (runs before the shared _reserved_cash lock even exists for this attempt, so
+        `reserved` defaults to 0.0) and the authoritative check (which does subtract
+        it, to prevent 2 concurrent promotions from both spending against the same
+        stale cash figure -- see the 2026-08-02 GitHub #44 fix). Both had
+        independently computed `total_value * (min_cash_reserve_pct / 100)` -- this
+        consolidates that formula into one place so the two can't drift on rounding
+        or formula details."""
+        required_reserve = self.portfolio.total_value * (
+            self.config["risk_management"]["min_cash_reserve_pct"] / 100)
+        return cash - reserved - position_size < required_reserve
+
     async def _attempt_near_miss_promotion(
         self, ticker: str, nm_snapshot: dict | None = None, dip_low: float | None = None,
         sma_context: dict | None = None,
@@ -5638,6 +5791,22 @@ class DashboardState:
         bought = False
         reserved_amount = 0.0
         evicted = False
+
+        async def _fail_gate(message: str, reason: str, level: str = "warning", **record_kwargs) -> None:
+            """Shared tail for a simple gate-failure branch below: log + broadcast +
+            _record_promotion_attempt, in that order. Extracted (ported 2026-08-24 from
+            AITrading, GitHub #90) from 14 near-identical 3-line blocks in this function.
+            Deliberately does NOT also call _refresh_nm_from_report or handle the
+            wash-sale/shortability eviction branches' extra pop/evicted=True/cache-save
+            steps -- those genuinely differ per branch (some refresh with rr_val/
+            required_rr_val, one refreshes conditionally, two evict instead of just
+            recording) and stay inline at each call site exactly as before, so this
+            closure only ever removes the one piece of logic that really was byte-for-
+            byte identical everywhere it appeared."""
+            entry = self.add_ai_log(ticker, "ON_DECK", message, level)
+            await self.broadcast({"type": "ai_log", "entry": entry})
+            self._record_promotion_attempt(ticker, dip_low, reason, **record_kwargs)
+
         try:
             if not self.config["trading"].get("auto_execute", False) or not self.broker_connected:
                 return
@@ -5649,10 +5818,9 @@ class DashboardState:
             _cutoff_str = self.config["research"].get("auto_buy_cutoff_time", "14:00")
             _ch, _cm = _cutoff_str.split(":")
             if self._now_et().time() >= dtime(int(_ch), int(_cm)):
-                entry = self.add_ai_log(ticker, "ON_DECK",
-                    f"R/R + rollover confirmed but past {_cutoff_str} ET cutoff — skipping", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(ticker, dip_low, f"Past {_cutoff_str} ET cutoff")
+                await _fail_gate(
+                    f"R/R + rollover confirmed but past {_cutoff_str} ET cutoff — skipping",
+                    f"Past {_cutoff_str} ET cutoff")
                 return
 
             # Wash-sale rebuy block (2026-07-27) — pure in-memory dict lookup (see
@@ -5717,15 +5885,11 @@ class DashboardState:
             if approx_price and approx_stop and approx_price > 0 and approx_stop > 0:
                 approx_size = self.risk_manager.calculate_position_size(
                     approx_price, approx_stop, self.portfolio.total_value)
-                approx_reserve = self.portfolio.total_value * (
-                    self.config["risk_management"]["min_cash_reserve_pct"] / 100)
-                if self.portfolio.cash - approx_size < approx_reserve:
-                    entry = self.add_ai_log(ticker, "ON_DECK",
+                if self._cash_reserve_insufficient(self.portfolio.cash, approx_size):
+                    await _fail_gate(
                         "Insufficient cash reserve (pre-check against cached price) — "
-                        "skipping before spending on a fresh AI re-analysis", "warning")
-                    await self.broadcast({"type": "ai_log", "entry": entry})
-                    self._record_promotion_attempt(
-                        ticker, dip_low, "Insufficient cash reserve (pre-check)")
+                        "skipping before spending on a fresh AI re-analysis",
+                        "Insufficient cash reserve (pre-check)")
                     return
 
             # Earnings blackout (fixed 2026-08-08, GitHub #54) -- CLAUDE.md has documented
@@ -5740,12 +5904,9 @@ class DashboardState:
             # calendar lookup itself failed.
             earnings_soon, earnings_date = await self._earnings_soon(ticker)
             if earnings_soon:
-                entry = self.add_ai_log(ticker, "ON_DECK",
+                await _fail_gate(
                     f"Skipped — earnings on {earnings_date}, within the auto-buy blackout window",
-                    "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"Earnings blackout ({earnings_date})")
+                    f"Earnings blackout ({earnings_date})")
                 return
 
             entry = self.add_ai_log(ticker, "ON_DECK",
@@ -5760,9 +5921,7 @@ class DashboardState:
                     analysis_history_summary=analysis_history_summary,
                     sma_context=sma_context)
             except Exception as e:
-                entry = self.add_ai_log(ticker, "ON_DECK", f"Re-analysis failed: {e}", "error")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(ticker, dip_low, f"Re-analysis failed: {e}")
+                await _fail_gate(f"Re-analysis failed: {e}", f"Re-analysis failed: {e}", level="error")
                 return
 
             min_conviction = self.config["research"]["min_conviction_score"]
@@ -5813,12 +5972,10 @@ class DashboardState:
                     or report.signal.value not in ("BUY", "STRONG BUY")
                     or report.conviction_score < min_conviction
                     or report.entry_price <= 0 or report.stop_loss <= 0):
-                entry = self.add_ai_log(ticker, "ON_DECK",
+                await _fail_gate(
                     f"No longer qualifies on fresh data — {report.signal.value} | "
-                    f"Conviction {report.conviction_score}/10", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"No longer qualifies — {report.signal.value}",
+                    f"Conviction {report.conviction_score}/10",
+                    f"No longer qualifies — {report.signal.value}",
                     conviction=report.conviction_score, price=report.entry_price)
                 if not getattr(report, "is_fallback", True):
                     _refresh_nm_from_report()
@@ -5843,11 +6000,9 @@ class DashboardState:
                 sma_context is not None, getattr(report, "trend_confirms_entry", False),
                 rr, rr_floor)
             if rr < min_rr and not track2_override:
-                entry = self.add_ai_log(ticker, "ON_DECK",
-                    f"R/R fell back below gate on fresh data — {rr:.2f} < {min_rr:.2f}", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"R/R fell below gate ({rr:.2f} < {min_rr:.2f})",
+                await _fail_gate(
+                    f"R/R fell back below gate on fresh data — {rr:.2f} < {min_rr:.2f}",
+                    f"R/R fell below gate ({rr:.2f} < {min_rr:.2f})",
                     conviction=report.conviction_score, rr=rr, price=report.entry_price)
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
                 return
@@ -5880,12 +6035,9 @@ class DashboardState:
                     conviction_score=report.conviction_score, fail_default=False,
                 )
                 if not still_good_buy:
-                    entry = self.add_ai_log(ticker, "ON_DECK",
+                    await _fail_gate(
                         f"R/R {rr:.2f} above its own gate ({min_rr:.2f}) at the buy trigger "
-                        f"— AI judged it's not a genuine opportunity: {reasoning}", "warning")
-                    await self.broadcast({"type": "ai_log", "entry": entry})
-                    self._record_promotion_attempt(
-                        ticker, dip_low,
+                        f"— AI judged it's not a genuine opportunity: {reasoning}",
                         f"R/R above gate, AI declined at buy trigger ({rr:.2f} > {min_rr:.2f})",
                         conviction=report.conviction_score, rr=rr, price=report.entry_price)
                     _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
@@ -5908,20 +6060,16 @@ class DashboardState:
             # average, since they're actively watching the dashboard).
 
             if not self.risk_manager.check_daily_loss(self.portfolio):
-                entry = self.add_ai_log(ticker, "ON_DECK", "Daily loss limit reached — skipping", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, "Daily loss limit reached",
+                await _fail_gate(
+                    "Daily loss limit reached — skipping", "Daily loss limit reached",
                     conviction=report.conviction_score, rr=rr, price=report.entry_price)
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
                 return
             dd_state = self.risk_manager.check_drawdown(self.portfolio)
             if dd_state in ("halt", "exit_review", "defensive"):
-                entry = self.add_ai_log(ticker, "ON_DECK",
-                    f"Portfolio in {dd_state} state — skipping ({self._drawdown_diagnostic()})", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"Portfolio in {dd_state} state",
+                await _fail_gate(
+                    f"Portfolio in {dd_state} state — skipping ({self._drawdown_diagnostic()})",
+                    f"Portfolio in {dd_state} state",
                     conviction=report.conviction_score, rr=rr, price=report.entry_price)
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
                 return
@@ -5933,11 +6081,9 @@ class DashboardState:
             # nothing here despite being turned on in Settings.
             sector = getattr(report, "sector", "")
             if not self.risk_manager.check_sector_concentration(self.portfolio, sector):
-                entry = self.add_ai_log(ticker, "ON_DECK",
-                    f"Sector concentration limit reached ({sector}) — skipping", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"Sector concentration limit reached ({sector})",
+                await _fail_gate(
+                    f"Sector concentration limit reached ({sector}) — skipping",
+                    f"Sector concentration limit reached ({sector})",
                     conviction=report.conviction_score, rr=rr, price=report.entry_price)
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
                 return
@@ -5946,30 +6092,24 @@ class DashboardState:
                 report.entry_price, report.stop_loss, self.portfolio.total_value)
             shares = position_size / report.entry_price if report.entry_price > 0 else 0
             if shares < 0.001:
-                entry = self.add_ai_log(ticker, "ON_DECK", "Position size too small — skipping", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, "Position size too small",
+                await _fail_gate(
+                    "Position size too small — skipping", "Position size too small",
                     conviction=report.conviction_score, rr=rr, price=report.entry_price)
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
                 return
 
-            required_reserve = self.portfolio.total_value * (
-                self.config["risk_management"]["min_cash_reserve_pct"] / 100)
             # Lock scope is deliberately tight -- just the shared-state check-then-reserve,
             # not the failure-path logging/broadcast below (which await and don't need to
             # be serialized against other concurrent promotion attempts).
             async with self._promotion_cash_lock:
-                insufficient = (self.portfolio.cash - self._reserved_cash - position_size
-                                < required_reserve)
+                insufficient = self._cash_reserve_insufficient(
+                    self.portfolio.cash, position_size, reserved=self._reserved_cash)
                 if not insufficient:
                     self._reserved_cash += position_size
                     reserved_amount = position_size
             if insufficient:
-                entry = self.add_ai_log(ticker, "ON_DECK", "Insufficient cash reserve — skipping", "warning")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, "Insufficient cash reserve",
+                await _fail_gate(
+                    "Insufficient cash reserve — skipping", "Insufficient cash reserve",
                     conviction=report.conviction_score, rr=rr, price=report.entry_price)
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
                 return
@@ -5999,10 +6139,8 @@ class DashboardState:
             try:
                 order = await self.order_manager.execute(signal)
             except Exception as e:
-                entry = self.add_ai_log(ticker, "ON_DECK", f"Buy failed: {e}", "error")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"Buy failed: {e}",
+                await _fail_gate(
+                    f"Buy failed: {e}", f"Buy failed: {e}", level="error",
                     conviction=report.conviction_score, rr=rr, price=report.entry_price)
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
                 return
@@ -6041,11 +6179,9 @@ class DashboardState:
                     ticker, dip_low, "Bought",
                     conviction=report.conviction_score, rr=rr, price=_fp)
             elif order:
-                entry = self.add_ai_log(ticker, "ON_DECK",
-                    f"Buy rejected by broker: {order.status.value}", "error")
-                await self.broadcast({"type": "ai_log", "entry": entry})
-                self._record_promotion_attempt(
-                    ticker, dip_low, f"Rejected by broker: {order.status.value}",
+                await _fail_gate(
+                    f"Buy rejected by broker: {order.status.value}",
+                    f"Rejected by broker: {order.status.value}", level="error",
                     conviction=report.conviction_score, rr=rr, price=report.entry_price)
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
         finally:
@@ -6311,13 +6447,13 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         Submits the first chunk via research_engine.submit_analysis_batch(). While a
         chunk is in flight, if it has been running longer than
         max(3 minutes, 2x the fastest chunk completed so far this run) and neither
-        self.paused nor the caller's `should_stop()` says to stop, pulls and submits the
+        self.paused/self.stopped nor the caller's `should_stop()` says to stop, pulls and submits the
         next chunk from `chunk_source` concurrently (capped at 2 chunks in flight at
         once) rather than waiting further — a slow batch doesn't stall the whole scan,
         but a normal-speed run stays sequential with no wasted concurrent spend. Calls
         `on_result(ticker, report)` (async) for every ticker as soon as its batch's
         results are ready, in whatever order batches complete. New chunks stop being
-        pulled once `should_stop()` returns True or self.paused is set, but any already
+        pulled once `should_stop()` returns True or self.paused/self.stopped is set, but any already
         in-flight batch is always allowed to finish and its results are always
         processed — already-submitted batch work is already paid for and is never
         discarded outright (the caller's own on_result can still choose not to act on a
@@ -6466,7 +6602,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             return elapsed
 
         async def _try_submit_next() -> bool:
-            if self.paused or should_stop():
+            if self.paused or self.stopped or should_stop():
                 return False
             chunk = await _next_chunk()
             if not chunk:
@@ -7102,6 +7238,11 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             "margin_of_safety_pct": report.margin_of_safety_pct,
             "generated_at": report.generated_at.isoformat(),
             "source": source,
+            # Ported 2026-08-24 from AITrading, GitHub #81 -- report_data (the cached,
+            # dashboard-visible copy of this report) never carried is_fallback at all, so
+            # a fallback report's cached entry was indistinguishable from a real one once
+            # persisted here.
+            "is_fallback": getattr(report, "is_fallback", False),
         }
         self.research_reports[report.ticker] = report_data
         asyncio.create_task(self.broadcast({"type": "report", "report": report_data}))
@@ -7303,11 +7444,11 @@ Respond with ONLY the summary text, no preamble, no markdown."""
 
         async def _persist_chunks():
             for i in range(0, len(to_persist_check), 100):
-                if self.paused:
+                if self.paused or self.stopped:
                     return
                 yield to_persist_check[i:i + 100]
 
-        if to_persist_check and not self.paused:
+        if to_persist_check and not (self.paused or self.stopped):
             await _log("SYSTEM",
                 f"Persist-check — re-analyzing {len(to_persist_check)} existing On Deck "
                 "candidate(s)")
@@ -7500,7 +7641,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 nonlocal screened_out, scanned, already_covered
                 buffer: list[str] = []
                 for ticker in universe_candidates:
-                    if self.paused:
+                    if self.paused or self.stopped:
                         break
                     if (ticker in held_tickers or ticker in self.near_miss_candidates
                             or self._is_on_deck_blocked(ticker)):
@@ -7536,8 +7677,8 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 if buffer:
                     yield buffer
 
-            if self.paused:
-                logger.info("Mid-day re-scan skipped — paused")
+            if self.paused or self.stopped:
+                logger.info("Mid-day re-scan skipped — %s", self.run_status())
             else:
                 await self._run_batched_chunk_loop(_chunks(), _on_result)
 
@@ -7599,7 +7740,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             await self.broadcast({"type": "ai_log", "entry": entry})
 
             for ticker in STOCK_UNIVERSE:
-                if self.paused:
+                if self.paused or self.stopped:
                     break
                 if ticker in held_tickers or ticker in self.near_miss_candidates:
                     continue
@@ -7728,7 +7869,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             buffer: list[str] = []
             _last_progress_log = scanned
             for ticker in universe_candidates:
-                if self.paused:
+                if self.paused or self.stopped:
                     break
                 if (ticker in held_tickers or ticker in self.near_miss_candidates
                         or self._is_on_deck_blocked(ticker)):
@@ -7771,8 +7912,8 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             if buffer:
                 yield buffer
 
-        if self.paused:
-            logger.info("Pre-open scan skipped — paused")
+        if self.paused or self.stopped:
+            logger.info("Pre-open scan skipped — %s", self.run_status())
         else:
             await self._run_batched_chunk_loop(_chunks(), _on_result)
 
@@ -8612,11 +8753,11 @@ async def apply_update():
 
             old_requirements_path = Path(_INSTALL_ROOT) / "requirements.txt"
             old_requirements = (
-                old_requirements_path.read_text() if old_requirements_path.exists() else ""
+                old_requirements_path.read_text(encoding="utf-8") if old_requirements_path.exists() else ""
             )
             new_requirements_path = Path(extracted_root) / "requirements.txt"
             new_requirements = (
-                new_requirements_path.read_text() if new_requirements_path.exists() else old_requirements
+                new_requirements_path.read_text(encoding="utf-8") if new_requirements_path.exists() else old_requirements
             )
             needs_pip_install = requirements_changed(old_requirements, new_requirements)
 
@@ -9029,14 +9170,15 @@ async def get_stock_chart(ticker: str):
     manual Deep Dive modal.  Works for any ticker the owner types, not just held
     positions.  ref_lines come from the most-recent cached research report when one
     exists, so entry/stop/TP/fair-value price lines show up automatically."""
-    import math as _math
-
     import yfinance as yf
 
     def _fin(v):
         """Return None for NaN/Inf (yfinance occasionally returns these); otherwise v.
-        JSON cannot serialize NaN — a single bad bar crashes the whole endpoint with 500."""
-        return None if (v is None or (isinstance(v, float) and not _math.isfinite(v))) else v
+        JSON cannot serialize NaN — a single bad bar crashes the whole endpoint with 500.
+        Ported 2026-08-24 from AITrading, GitHub #85 -- shares the same is_usable_price
+        helper the composition-benchmark module and _live_holdings_value now both use,
+        instead of an independent inline isfinite check."""
+        return v if is_usable_price(v) else None
 
     ticker = ticker.upper()
     try:
@@ -9467,9 +9609,11 @@ def _live_holdings_value() -> dict:
     holdings_value = {}
     for t, pos in state.portfolio.positions.items():
         shares, price = pos.shares, pos.current_price
-        if (shares is None or price is None
-                or (isinstance(shares, float) and math.isnan(shares))
-                or (isinstance(price, float) and math.isnan(price))):
+        # Ported 2026-08-24 from AITrading, GitHub #85 -- now shares the same
+        # is_usable_price helper composition_benchmark.py's own NaN guards use, instead
+        # of an independent inline check that (unlike is_usable_price) never guarded
+        # against Inf.
+        if not is_usable_price(shares) or not is_usable_price(price):
             logger.warning(
                 "_live_holdings_value: skipping %s -- shares=%r current_price=%r", t, shares, price)
             continue
@@ -10113,6 +10257,17 @@ async def manual_buy(payload: dict):
         take_profit_targets=targets,
     )
 
+    # Sector populated here (ported 2026-08-24 from AITrading, GitHub #79) -- without a
+    # real sector, check_sector_concentration()'s own `if not sector: return True`
+    # early-out always passes, silently letting a manual buy bypass the sector cap the
+    # automated On Deck path already enforces. Same real, cheap (no Claude call) lookup
+    # analyze_stock() itself uses, fail-open on a fetch error.
+    try:
+        financials = await state.market_data.get_financials(ticker)
+        report.sector = getattr(financials, "sector", "") or ""
+    except Exception:
+        pass
+
     if not state.risk_manager.check_all_rules(report, state.portfolio):
         raise HTTPException(status_code=400, detail="Trade rejected by risk management (cash reserve, sector limits, or drawdown rules)")
 
@@ -10243,6 +10398,74 @@ async def save_keys(payload: dict):
     return {"status": "ok"}
 
 
+@app.post("/api/pause")
+async def pause_trading():
+    """Pause (built 2026-08-25, ported from AITrading's GitHub #78 fix, itself ported
+    from AICryptoTrading's identical, already-working feature) -- stops every
+    AI-spend loop (position_monitor_loop, position_deep_dive_loop, auto_scan_loop,
+    watchlist_rr_loop, near_miss_monitor_loop, the pre-open/midday batch paths). Zero
+    Claude calls. position_update_loop keeps running -- held positions stay fully
+    protected (stop-loss/trailing-stop/protection-gap checks/exit-order sync) -- see
+    run_status()'s own docstring for the full paused/stopped split. Persists to disk
+    so this survives a restart/Apply Update, unlike the pre-existing WebSocket
+    "pause"/"resume" commands, which never called _save_run_state() at all."""
+    state.paused = True
+    state._save_run_state()
+    entry = state.add_ai_log("SYSTEM", "SYSTEM",
+        "Trading paused — no scans or AI analysis will run until resumed.", "warning")
+    await state.broadcast({"type": "ai_log", "entry": entry})
+    await state.broadcast({"type": "run_status", "run_status": state.run_status()})
+    return {"status": "paused", "run_status": state.run_status()}
+
+
+@app.post("/api/resume")
+async def resume_trading():
+    """Counterpart to /api/pause -- clears paused only (does not affect stopped)."""
+    state.paused = False
+    state._save_run_state()
+    entry = state.add_ai_log("SYSTEM", "SYSTEM",
+        "Trading resumed — scans and AI analysis active again.", "info")
+    await state.broadcast({"type": "ai_log", "entry": entry})
+    await state.broadcast({"type": "run_status", "run_status": state.run_status()})
+    return {"status": "resumed", "run_status": state.run_status()}
+
+
+@app.post("/api/stop")
+async def stop_trading():
+    """Full stop (built 2026-08-25, ported from AITrading's GitHub #78 fix, itself
+    ported from AICryptoTrading's identical, already-working feature) -- every loop
+    halts, including position_update_loop -- no broker-side position management of
+    any kind happens while stopped, on top of everything /api/pause already blocks.
+    Deliberately does NOT kill the process itself (same reasoning as AICryptoTrading's
+    own /api/stop) -- a real process kill has no self-service recovery path for a
+    non-technical operator (no dashboard to reach, no button to click, only
+    SSH+systemctl); this way the dashboard and Start System button stay reachable,
+    with the exact same real-world effect (zero AI spend, zero broker-side
+    management) while stopped."""
+    state.stopped = True
+    state._save_run_state()
+    entry = state.add_ai_log("SYSTEM", "SYSTEM",
+        "Trading STOPPED — no scans, AI analysis, or position management (stop-loss/"
+        "trailing-stop/take-profit) will run until Start System is clicked.", "warning")
+    await state.broadcast({"type": "ai_log", "entry": entry})
+    await state.broadcast({"type": "run_status", "run_status": state.run_status()})
+    return {"status": "stopped", "run_status": state.run_status()}
+
+
+@app.post("/api/start")
+async def start_trading():
+    """Clears both stopped and paused -- the counterpart to /api/stop, brings the
+    system back to fully running from either a pause or a full stop."""
+    state.paused = False
+    state.stopped = False
+    state._save_run_state()
+    entry = state.add_ai_log("SYSTEM", "SYSTEM",
+        "Trading started — all systems running normally.", "success")
+    await state.broadcast({"type": "ai_log", "entry": entry})
+    await state.broadcast({"type": "run_status", "run_status": state.run_status()})
+    return {"status": "running", "run_status": state.run_status()}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     # Auth gate (2026-07-22, GitHub #13) -- BaseHTTPMiddleware (what @app.middleware("http")
@@ -10268,11 +10491,22 @@ async def websocket_endpoint(websocket: WebSocket):
             cmd = data.get("command")
 
             if cmd == "pause":
+                # Fixed 2026-08-25 (Stop System build) -- this WS path never called
+                # _save_run_state() at all, so a pause set here silently un-paused on
+                # the very next restart/Apply Update with no warning, exactly the gap
+                # the paused/stopped feature's own design comment says persistence
+                # exists to close. The dashboard's own Pause button now calls
+                # POST /api/pause instead (see that endpoint's docstring), but this
+                # command is kept working the same way for any other caller.
                 state.paused = True
+                state._save_run_state()
                 await state.broadcast({"type": "paused", "paused": True})
+                await state.broadcast({"type": "run_status", "run_status": state.run_status()})
             elif cmd == "resume":
                 state.paused = False
+                state._save_run_state()
                 await state.broadcast({"type": "paused", "paused": False})
+                await state.broadcast({"type": "run_status", "run_status": state.run_status()})
             elif cmd == "get_portfolio":
                 await websocket.send_json({"type": "portfolio", "portfolio": state.get_portfolio_snapshot()})
             elif cmd == "set_max_positions":

@@ -16,6 +16,24 @@ logger = logging.getLogger(__name__)
 # Matches Alpaca's "insufficient qty available for order (requested: X, available: Y)"
 _INSUFFICIENT_QTY_RE = re.compile(r"available:\s*([\d.]+)")
 
+
+def _resolve_retry_quantity(error_message: str) -> float:
+    """Parses Alpaca's own "available: N" figure out of an "insufficient qty"
+    rejection's error text, returning 0.0 if unparseable. Extracted (ported 2026-08-24
+    from AITrading, GitHub #89) from 3 near-identical `match = _INSUFFICIENT_QTY_RE.
+    search(str(e)); available = float(match.group(1)) if match else 0.0` sites in this
+    file (2 inside _place_stop_only's stop/market-fallback retry branches, 1 inside
+    _execute_take_profit_tranche's own settlement-lag retry) -- each site's caller
+    still owns its own retry/sleep/logging decision around this parsed value, since
+    those genuinely differ per site (e.g. _execute_sell's own "insufficient qty"
+    handling deliberately does NOT use this regex at all -- confirmed
+    AlpacaBroker.get_positions() (the bulk method that path already calls) has no
+    qty_available field, only the single-ticker get_position() does, so it re-fetches
+    real share counts from Alpaca directly instead of parsing this error string; kept
+    as its own distinct mechanism rather than forced through this helper)."""
+    match = _INSUFFICIENT_QTY_RE.search(error_message)
+    return float(match.group(1)) if match else 0.0
+
 # Backoff schedule (seconds) for consecutive sync_exit_orders remediation failures on the
 # same ticker (2026-07-28) -- index 0 applies after the 1st failure, index 1 after the
 # 2nd, etc.; the schedule's last value repeats for any further consecutive failures
@@ -1137,6 +1155,33 @@ class OrderManager:
         never got a working order this call."""
         return await self._place_stop_only(ticker, shares, stop_price)
 
+    async def _submit_buy_to_close(
+        self, ticker: str, order_type: "OrderType", quantity: float,
+        stop_price: float | None = None,
+    ) -> "Order":
+        """Builds and submits a buy-to-close order (BUY side, buy_to_close
+        position_intent -- covering a short is always a buy, the inverse of AITrading's
+        own sell-to-close shape), tracking it in active_orders and (for a STOP order)
+        _stop_order_ids. Extracted (ported 2026-08-24 from AITrading, GitHub #88) from
+        _place_stop_only, whose retry logic hit this exact build-submit-track sequence
+        7 times across its fallback branches (the initial stop attempt, the
+        stop-breached market fallback, and 2 retry tiers of each) -- consolidating it
+        here means a future retry tier added to that function can't independently typo
+        the order shape or forget to track the result. Raises whatever
+        self.broker.submit_order raises; every existing caller already wraps its own
+        call in try/except with its own retry/logging, so this doesn't change any
+        caller's error-handling behavior, only removes the duplicated construction."""
+        kwargs = {"stop_price": round(stop_price, 2)} if order_type == OrderType.STOP else {}
+        order = Order(
+            ticker=ticker, side=OrderSide.BUY, order_type=order_type,
+            quantity=quantity, position_intent="buy_to_close", **kwargs,
+        )
+        result = await self.broker.submit_order(order)
+        self.active_orders[result.broker_order_id] = result
+        if order_type == OrderType.STOP:
+            self._stop_order_ids[ticker] = result.broker_order_id
+        return result
+
     async def _place_stop_only(self, ticker: str, shares: float, stop_price: float) -> bool:
         """The stop-placement half of the old _place_exit_orders, extracted verbatim
         (2026-08-11) so both _place_exit_orders (the normal "no exit orders yet" path)
@@ -1161,16 +1206,7 @@ class OrderManager:
         if stop_price is not None and stop_price > 0 and stop_shares > 0:
             stop_ok = False  # about to attempt; only True once a submit actually succeeds
             try:
-                stop_order = Order(
-                    ticker=ticker, side=OrderSide.BUY,
-                    order_type=OrderType.STOP,
-                    quantity=stop_shares,
-                    stop_price=round(stop_price, 2),
-                    position_intent="buy_to_close",
-                )
-                stop_result = await self.broker.submit_order(stop_order)
-                self.active_orders[stop_result.broker_order_id] = stop_result
-                self._stop_order_ids[ticker] = stop_result.broker_order_id
+                await self._submit_buy_to_close(ticker, OrderType.STOP, stop_shares, stop_price)
                 logger.info("Buy-to-close stop placed for %s: %.4g shares @ $%.2f", ticker, stop_shares, stop_price)
                 stop_ok = True
             except Exception as e:
@@ -1208,14 +1244,7 @@ class OrderManager:
                         stop_price, ticker, shares,
                     )
                     try:
-                        market_order = Order(
-                            ticker=ticker, side=OrderSide.BUY,
-                            order_type=OrderType.MARKET,
-                            quantity=shares,
-                            position_intent="buy_to_close",
-                        )
-                        market_result = await self.broker.submit_order(market_order)
-                        self.active_orders[market_result.broker_order_id] = market_result
+                        await self._submit_buy_to_close(ticker, OrderType.MARKET, shares)
                         logger.info(
                             "Market buy-to-close submitted for %s (%.4g shares) — stop was already breached",
                             ticker, shares,
@@ -1234,24 +1263,16 @@ class OrderManager:
                         # "available: N" and retry once with that exact quantity, same
                         # fix already proven for the stop-order path above.
                         if "insufficient qty" in e2_str or "insufficient quantity" in e2_str:
-                            match = _INSUFFICIENT_QTY_RE.search(str(e2))
-                            available = float(match.group(1)) if match else 0.0
+                            available = _resolve_retry_quantity(str(e2))
                             if available > 0:
                                 logger.warning(
                                     "Market-sell fallback for %s rejected on qty (requested "
                                     "%.9f, available %s) — retrying with broker's exact "
                                     "available quantity",
-                                    ticker, shares, match.group(1),
+                                    ticker, shares, available,
                                 )
                                 try:
-                                    market_order = Order(
-                                        ticker=ticker, side=OrderSide.BUY,
-                                        order_type=OrderType.MARKET,
-                                        quantity=available,
-                                        position_intent="buy_to_close",
-                                    )
-                                    market_result = await self.broker.submit_order(market_order)
-                                    self.active_orders[market_result.broker_order_id] = market_result
+                                    await self._submit_buy_to_close(ticker, OrderType.MARKET, available)
                                     logger.info(
                                         "Market buy-to-close submitted for %s (%.4g shares, "
                                         "qty-corrected retry) — stop was already breached",
@@ -1279,14 +1300,7 @@ class OrderManager:
                                 )
                                 await asyncio.sleep(2)
                                 try:
-                                    market_order = Order(
-                                        ticker=ticker, side=OrderSide.BUY,
-                                        order_type=OrderType.MARKET,
-                                        quantity=shares,
-                                        position_intent="buy_to_close",
-                                    )
-                                    market_result = await self.broker.submit_order(market_order)
-                                    self.active_orders[market_result.broker_order_id] = market_result
+                                    await self._submit_buy_to_close(ticker, OrderType.MARKET, shares)
                                     logger.info(
                                         "Market buy-to-close submitted for %s (%.4g shares, "
                                         "available:0 retry) — stop was already breached",
@@ -1321,16 +1335,7 @@ class OrderManager:
                     )
                     await asyncio.sleep(3)
                     try:
-                        stop_order = Order(
-                            ticker=ticker, side=OrderSide.BUY,
-                            order_type=OrderType.STOP,
-                            quantity=stop_shares,
-                            stop_price=round(stop_price, 2),
-                            position_intent="buy_to_close",
-                        )
-                        stop_result = await self.broker.submit_order(stop_order)
-                        self.active_orders[stop_result.broker_order_id] = stop_result
-                        self._stop_order_ids[ticker] = stop_result.broker_order_id
+                        await self._submit_buy_to_close(ticker, OrderType.STOP, stop_shares, stop_price)
                         logger.info(
                             "Buy-to-close stop placed for %s: %.4g shares @ $%.2f (wash-trade retry)",
                             ticker, stop_shares, stop_price,
@@ -1349,25 +1354,15 @@ class OrderManager:
                     # difference) can make Alpaca reject an otherwise-correct stop order
                     # outright. Parse the broker's own "available: N" figure from the error
                     # and retry once with that exact quantity instead of our computed one.
-                    match = _INSUFFICIENT_QTY_RE.search(str(e))
-                    available = float(match.group(1)) if match else 0.0
+                    available = _resolve_retry_quantity(str(e))
                     if available > 0:
                         logger.warning(
                             "Stop order for %s rejected on qty (requested %.9f, available %s) — "
                             "retrying with broker's exact available quantity",
-                            ticker, stop_shares, match.group(1),
+                            ticker, stop_shares, available,
                         )
                         try:
-                            stop_order = Order(
-                                ticker=ticker, side=OrderSide.BUY,
-                                order_type=OrderType.STOP,
-                                quantity=available,
-                                stop_price=round(stop_price, 2),
-                                position_intent="buy_to_close",
-                            )
-                            stop_result = await self.broker.submit_order(stop_order)
-                            self.active_orders[stop_result.broker_order_id] = stop_result
-                            self._stop_order_ids[ticker] = stop_result.broker_order_id
+                            await self._submit_buy_to_close(ticker, OrderType.STOP, available, stop_price)
                             logger.info(
                                 "Buy-to-close stop placed for %s: %.4g shares @ $%.2f (qty-corrected retry)",
                                 ticker, available, stop_price,
@@ -1389,16 +1384,7 @@ class OrderManager:
                         )
                         await asyncio.sleep(2)
                         try:
-                            stop_order = Order(
-                                ticker=ticker, side=OrderSide.BUY,
-                                order_type=OrderType.STOP,
-                                quantity=stop_shares,
-                                stop_price=round(stop_price, 2),
-                                position_intent="buy_to_close",
-                            )
-                            stop_result = await self.broker.submit_order(stop_order)
-                            self.active_orders[stop_result.broker_order_id] = stop_result
-                            self._stop_order_ids[ticker] = stop_result.broker_order_id
+                            await self._submit_buy_to_close(ticker, OrderType.STOP, stop_shares, stop_price)
                             logger.info(
                                 "Buy-to-close stop placed for %s: %.4g shares @ $%.2f (available:0 retry)",
                                 ticker, stop_shares, stop_price,
@@ -1416,6 +1402,16 @@ class OrderManager:
         return stop_ok
 
     async def _execute_sell(self, signal) -> Order | None:
+        """Note on the insufficient-qty retry below (documented 2026-08-24, ported from
+        AITrading GitHub #93): this deliberately does NOT use the same shared
+        available-quantity-parsing helper _place_stop_only/_execute_take_profit_tranche
+        use for their own insufficient-qty rejections. Confirmed via AlpacaBroker: the
+        bulk get_positions() this function already calls to re-sync a stale local
+        share count has no qty_available field at all (only the single-ticker
+        get_position() does) -- so there's no equivalent broker-reported "available"
+        number to parse out of the rejection here. Instead this re-fetches the real
+        share count directly from Alpaca and retries once against that. Kept as its
+        own distinct mechanism rather than forced through the shared helper."""
         position = self.portfolio.positions.get(signal.ticker)
         if not position:
             logger.warning("No position to sell for %s", signal.ticker)
@@ -2109,8 +2105,7 @@ class OrderManager:
                 err_str = str(e).lower()
                 retried = False
                 if "insufficient qty" in err_str or "insufficient quantity" in err_str:
-                    match = _INSUFFICIENT_QTY_RE.search(str(e))
-                    available = float(match.group(1)) if match else 0.0
+                    available = _resolve_retry_quantity(str(e))
                     if available > 0:
                         sell_qty = available
                     else:

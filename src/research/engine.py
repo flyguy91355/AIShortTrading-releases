@@ -20,6 +20,7 @@ from src.research.fundamental import FundamentalAnalyzer
 from src.research.sentiment import SentimentAnalyzer
 from src.research.insider_analysis import InsiderAnalyzer
 from src.research.competitor import CompetitorAnalyzer
+from src.research.market_cap import market_cap_tier_label
 from src.decision.risk_tier import build_risk_tier_prompt_section
 
 logger = logging.getLogger(__name__)
@@ -462,26 +463,14 @@ def _build_market_context_section(market_change_pct: float | None) -> str:
     )
 
 
-def _market_cap_tier_label(market_cap: float) -> str:
-    """Human-readable size tier for a market cap in dollars (2026-08-04, "billion dollar
-    stock" discussion) -- feeds recommend_dip_entry's staleness judgment, which previously
-    had zero information about company size and applied the same generic "is this many
-    days stale" instinct to a small volatile stock and a stable mega-cap alike. A large,
-    steady company's support/resistance levels reasonably persist longer than a small
-    volatile one's -- this gives Claude the context to calibrate for that instead of
-    guessing. Same bucket boundaries CompetitorAnalyzer._assess_position already uses
-    (src/research/competitor.py) for consistency across the codebase. Returns "" for a
-    non-positive/unknown market cap so the caller can omit the context line entirely
-    rather than asserting a tier it has no real data for."""
-    if market_cap <= 0:
-        return ""
-    if market_cap >= 200_000_000_000:
-        return "mega-cap"
-    if market_cap >= 10_000_000_000:
-        return "large-cap"
-    if market_cap >= 2_000_000_000:
-        return "mid-cap"
-    return "small-cap"
+# _market_cap_tier_label used to be defined here as its own standalone copy, with a
+# docstring claiming it shared bucket boundaries with CompetitorAnalyzer._assess_position
+# (src/research/competitor.py) -- that claim was false; the two had independently
+# drifted. Extracted to src/research/market_cap.py (ported 2026-08-24 from AITrading,
+# GitHub #82) as the single shared source both this module and competitor.py now import,
+# so they genuinely can't drift apart again. Kept as a module-level alias here since this
+# module's own call sites (and tests/test_market_cap_tier.py) reference the old name.
+_market_cap_tier_label = market_cap_tier_label
 
 
 def _build_sma_trend_section(
@@ -612,14 +601,23 @@ class ResearchEngine:
     ) -> ResearchReport:
         logger.info("Starting research analysis for %s", ticker)
 
+        # quote fetched first, alone -- get_long_term_trend genuinely needs quote.price
+        # to compute how far off the current price sits from the historical high/low.
+        # The other 4 fetches below have no dependency on it or on each other, so they
+        # run concurrently (ported 2026-08-24 from AITrading, GitHub #96) rather than
+        # sequentially -- roughly halves the real data-gathering latency per ticker,
+        # compounding with the existing scan-level concurrency during the pre-open/
+        # mid-day universe scans covering hundreds of tickers.
         quote = await self.market_data.get_quote(ticker)
-        financials = await self.market_data.get_financials(ticker)
-        technicals = await self.market_data.get_technicals(ticker)
-        long_term_trend = await self.market_data.get_long_term_trend(
-            ticker, quote.price,
-            years=self.config.get("research", {}).get("long_term_trend_years", 5))
-        insider_summary = await self.insider_tracker.get_insider_summary(ticker)
-        news_items = await self.news_feed.get_company_news(ticker, days=7)
+        financials, technicals, long_term_trend, insider_summary, news_items = await asyncio.gather(
+            self.market_data.get_financials(ticker),
+            self.market_data.get_technicals(ticker),
+            self.market_data.get_long_term_trend(
+                ticker, quote.price,
+                years=self.config.get("research", {}).get("long_term_trend_years", 5)),
+            self.insider_tracker.get_insider_summary(ticker),
+            self.news_feed.get_company_news(ticker, days=7),
+        )
 
         fundamental_score = await self.fundamental_analyzer.analyze(financials)
         sentiment_analysis = await self.sentiment_analyzer.analyze(news_items)
@@ -795,9 +793,8 @@ class ResearchEngine:
         market_change_pct = await self.market_data.get_market_change_pct()
         market_context_section = _build_market_context_section(market_change_pct)
         _risk_tier_cfg = self.config.get("risk_tier", {})
-        risk_tier_section = (
-            build_risk_tier_prompt_section(_risk_tier_cfg.get("value", 50.0))
-            if _risk_tier_cfg.get("mode", "auto") != "manual" else ""
+        risk_tier_section = build_risk_tier_prompt_section(
+            _risk_tier_cfg.get("value", 50.0), _risk_tier_cfg.get("mode", "auto"),
         )
         cap_tier = _market_cap_tier_label(market_cap) if market_cap else ""
         cap_line = f"\nCompany size: {cap_tier} (~${market_cap/1e9:.1f}B market cap)" if cap_tier else ""
@@ -1451,10 +1448,7 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             long_term_trend_section=_build_long_term_trend_section(long_term_trend_summary),
             user_note_section=_build_user_note_section(user_note_summary),
             market_context_section=_build_market_context_section(market_change_pct),
-            risk_tier_section=(
-                build_risk_tier_prompt_section(risk_tier_value)
-                if risk_tier_mode != "manual" else ""
-            ),
+            risk_tier_section=build_risk_tier_prompt_section(risk_tier_value, risk_tier_mode),
             analysis_history_section=_build_analysis_history_section(analysis_history_summary),
             sma_trend_section=sma_trend_section,
             stop_tp_instructions=stop_tp_instructions,

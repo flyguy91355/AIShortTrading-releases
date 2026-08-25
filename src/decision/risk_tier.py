@@ -129,13 +129,24 @@ _RISK_TIER_POSTURES = {
 }
 
 
-def build_risk_tier_prompt_section(tier_value: float) -> str:
+def build_risk_tier_prompt_section(tier_value: float, mode: str = "auto") -> str:
     """The AI-facing framing half of the risk-tier feature -- tells Claude directly
     what risk posture this portfolio is operating under, alongside the mechanical
     gate/sizing numbers compute_risk_tier_settings already changes. See
     _RISK_TIER_POSTURES for the owner-directed interpretive lean at each bucket
     (mirrors _build_market_context_section's own "give real data + explicit framing,
-    trust Claude's judgment" pattern in src/research/engine.py)."""
+    trust Claude's judgment" pattern in src/research/engine.py).
+
+    Returns "" when mode == "manual" (ported 2026-08-24 from AITrading, GitHub #86) --
+    both of engine.py's 2 real call sites used to duplicate this exact "if mode !=
+    manual else \"\"" ternary independently at the call site instead of the function
+    that actually owns the decision; consolidated here so a third call site can't
+    forget the check the way _persist_report/_on_deck_rr_* etc. were duplicated
+    elsewhere in this codebase before being unified. mode defaults to "auto" (the
+    function's original, pre-2026-08-23 behavior) so every existing caller that only
+    ever passed tier_value is unaffected."""
+    if mode == "manual":
+        return ""
     label = risk_tier_label(tier_value)
     t = max(0.0, min(100.0, tier_value))
     return (

@@ -209,6 +209,20 @@ def weighted_intraday_series(
     return series
 
 
+def is_usable_price(value) -> bool:
+    """True only if value is a real, finite number (2026-08-24, ported from AITrading
+    GitHub #85). Consolidates a NaN/Inf check that had independently drifted into at
+    least 4 places in this codebase: 3 near-identical `price is not None and not
+    math.isnan(price)` checks in this module (carry_forward_price, seed_last_known_prices,
+    has_real_close -- none of which also guarded against Inf), plus a separate isfinite-
+    based closure in web/app.py's get_stock_chart endpoint and a third, NaN-only variant
+    in web/app.py's _live_holdings_value. Every one of those existed to guard the same
+    real underlying risk this codebase has hit live more than once: yfinance can return
+    an actual float('nan') (or, in principle, an infinite value) instead of a genuinely
+    missing value, and Python's `is not None` check alone does not catch that."""
+    return value is not None and isinstance(value, (int, float)) and math.isfinite(value)
+
+
 def carry_forward_price(
     ticker: str, date: str, closes_by_ticker: dict[str, dict[str, float]],
     last_known: dict[str, float],
@@ -224,7 +238,7 @@ def carry_forward_price(
     (a single NaN ticker corrupts that whole day's total portfolio value and
     therefore every position's composition weight, not just its own)."""
     price = closes_by_ticker.get(ticker, {}).get(date)
-    if price is not None and not math.isnan(price):
+    if is_usable_price(price):
         last_known[ticker] = price
         return price
     return last_known.get(ticker)
@@ -247,7 +261,7 @@ def seed_last_known_prices(
         candidates = sorted(d for d in by_date if d < before_date)
         for d in reversed(candidates):
             price = by_date[d]
-            if price is not None and not math.isnan(price):
+            if is_usable_price(price):
                 seeded[symbol] = price
                 break
     return seeded
@@ -262,4 +276,4 @@ def has_real_close(symbol: str, date: str, closes_by_symbol: dict[str, dict[str,
     run knows to recompute it once the real data is published, rather than
     permanently freezing in a placeholder value."""
     price = closes_by_symbol.get(symbol, {}).get(date)
-    return price is not None and not math.isnan(price)
+    return is_usable_price(price)
