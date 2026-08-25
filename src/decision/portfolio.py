@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -997,19 +998,36 @@ class Portfolio:
         fire-and-forget via asyncio.create_task since this must never delay or block
         the real analysis flow it's recording. Never overwrites (unlike
         research_reports/reports_cache.json, which only ever keeps the LATEST report
-        per ticker)."""
+        per ticker).
+
+        Fails soft on a locked database (fixed 2026-08-25, ported from AITrading's
+        own fix the same day) -- this call is already fire-and-forget, so an
+        unhandled sqlite3.OperationalError here doesn't block anything else, but it
+        does surface as an ugly "Task exception was never retrieved" traceback in
+        the logs and silently drops this one ticker's history row for good, with no
+        retry. Same fail-soft precedent as watchlist_manager.set_scan_cursor's own
+        2026-08-25 fix -- this row is a losable, best-effort feed-forward record,
+        not correctness-critical; the next real analysis of this same ticker just
+        won't have this one row's worth of history to draw on."""
         if not self._db:
             return
-        await self._db.execute(
-            "INSERT INTO analysis_history "
-            "(ticker, generated_at, conviction_score, signal, entry_price, "
-            "fair_value_estimate, watch_condition, sma_relationship, trend_confirms_entry) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (ticker, generated_at, conviction_score, signal, entry_price,
-             fair_value_estimate, watch_condition, sma_relationship,
-             None if trend_confirms_entry is None else int(trend_confirms_entry)),
-        )
-        await self._db.commit()
+        try:
+            await self._db.execute(
+                "INSERT INTO analysis_history "
+                "(ticker, generated_at, conviction_score, signal, entry_price, "
+                "fair_value_estimate, watch_condition, sma_relationship, trend_confirms_entry) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ticker, generated_at, conviction_score, signal, entry_price,
+                 fair_value_estimate, watch_condition, sma_relationship,
+                 None if trend_confirms_entry is None else int(trend_confirms_entry)),
+            )
+            await self._db.commit()
+        except sqlite3.OperationalError as e:
+            logger.warning(
+                "save_analysis_history(%s): database still locked after the "
+                "connection's own timeout -- skipping this history row rather than "
+                "raising into the fire-and-forget task: %s", ticker, e,
+            )
 
     async def get_analysis_history_summary(self, ticker: str) -> str:
         """Every past real analysis for this ticker, formatted as prompt context for
