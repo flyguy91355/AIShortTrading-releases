@@ -258,6 +258,54 @@ Respond with ONLY the JSON object, no other text.
 """
 
 
+DEEP_DIVE_PROMPT_BRIEF = """\
+You are a senior equity research analyst specializing in SHORT-SELLING, producing a CONCISE deep-dive research note — the valuation/entry core only, not the full institutional report. This is an automatic background enrichment for a watchlist candidate, not a manual request, so keep every field tight.
+
+CRITICAL — WHAT "BUY"/"STRONG BUY" MEANS HERE: this system exclusively opens SHORT positions. A "BUY"/"STRONG BUY" signal means "open a SHORT position on this stock" — it does NOT mean purchase shares expecting the price to rise.
+
+TODAY'S DATE: {current_date}
+
+STOCK: {ticker} — {company_name}
+CURRENT PRICE: ${current_price:.2f}
+INITIAL SCREEN SIGNAL: {signal} (Conviction: {conviction}/10)
+INITIAL SCREEN FAIR VALUE ESTIMATE: ${prior_fair_value:.2f} (margin of safety {prior_mos:.1f}%) — refine this rather than deriving an unrelated new estimate from scratch.
+
+── FUNDAMENTAL DATA ──
+{fundamental_summary}
+
+── INSIDER ACTIVITY ──
+{insider_summary}
+
+── NEWS & SENTIMENT ──
+{news_summary}
+
+── COMPETITIVE POSITION ──
+{competitive_summary}
+
+── TECHNICAL CONTEXT ──
+{technical_summary}
+
+Respond as JSON with ONLY these fields — no catalysts list, no bull/base/bear scenarios, no monitoring checklist, no long narrative:
+{{
+    "signal": "<STRONG BUY|BUY|HOLD|SELL|STRONG SELL>",
+    "conviction_score": <1-10, one decimal place, e.g. 7.3>,
+    "thesis": "<2-3 sentence case for (or against) shorting this stock>",
+    "valuation_analysis": "<1-2 sentence valuation reasoning — brief, not a full DCF writeup>",
+    "fair_value_estimate": <intrinsic value estimate as a number>,
+    "margin_of_safety_pct": <percentage the CURRENT PRICE sits ABOVE fair value — negative if the stock still looks UNDERVALUED>,
+    "entry_price": <recommended price to sell short at>,
+    "stop_loss": <stop loss price — typically 5-8% above entry>,
+    "risk_factors": "<1-2 sentence summary of key squeeze/thesis risks>"
+}}
+
+Rules:
+- Every numeric field you output must be used consistently everywhere else in your response.
+- fair_value_estimate must be the actual output of the valuation methodology you describe in valuation_analysis.
+
+Respond with ONLY the JSON object, no other text.
+"""
+
+
 DEEPER_DIVE_PROMPT = """\
 You are a senior equity research analyst specializing in SHORT-SELLING, producing an institutional-grade DEEPER DIVE — the most comprehensive analysis possible on a single stock's case for (or against) shorting. You have already completed a standard deep dive. Now go significantly further.
 
@@ -1891,7 +1939,21 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             reports[ticker] = report
         return reports
 
-    async def deep_dive_analysis(self, ticker: str, model: str | None = None) -> DeepDiveReport:
+    async def deep_dive_analysis(
+            self, ticker: str, model: str | None = None, brief: bool = False) -> DeepDiveReport:
+        """brief=True (2026-08-26, cost-reduction request, ported from AITrading the
+        same day) uses DEEP_DIVE_PROMPT_BRIEF instead of the full DEEP_DIVE_PROMPT --
+        same valuation/entry core (signal, conviction, thesis, fair value, entry/stop,
+        brief risk factors), but drops the catalysts list, bull/base/bear scenarios,
+        monitoring checklist, and the long enhanced_reasoning narrative, which are the
+        most output-token-heavy fields (output tokens cost 5x input at Haiku 4.5
+        pricing). Only ever passed by the automatic On-Deck-entry pre-warm trigger
+        (_maybe_auto_deep_dive) when research.on_deck_auto_deep_dive_brief is enabled
+        -- a manual "Deep Dive" button click always uses the full prompt regardless,
+        per explicit owner direction ("i need it") to keep full detail available on
+        demand. DeepDiveReport's own fields all default to ""/[]/0.0, so the fields
+        this prompt doesn't ask for simply come back empty rather than crashing
+        anything downstream."""
         report = self.reports.get(ticker)
         if not report:
             raise ValueError(f"No scan report for {ticker} — run analyze_stock first")
@@ -1936,7 +1998,8 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
             f"Avg Volume 30d: {technicals.avg_volume_30d:,}"
         )
 
-        prompt = DEEP_DIVE_PROMPT.format(
+        prompt_template = DEEP_DIVE_PROMPT_BRIEF if brief else DEEP_DIVE_PROMPT
+        prompt = prompt_template.format(
             current_date=self._now_et().strftime("%Y-%m-%d"),
             ticker=report.ticker,
             company_name=report.company_name,
@@ -1957,7 +2020,9 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 # 2026-07-24: model_periodic_deep_dive can override this shared
                 # model_deep_dive default -- see CLAUDE.md's "Model Selection" section.
                 model=model or self.config.get("research", {}).get("model_deep_dive", "claude-sonnet-5"),
-                max_tokens=16000,
+                # brief mode caps max_tokens too (2026-08-26) -- a hard ceiling on
+                # worst-case output cost, not just a lighter prompt asking for less.
+                max_tokens=2500 if brief else 16000,
                 messages=[{"role": "user", "content": prompt}],
             )
             response_text = response_text.strip()
