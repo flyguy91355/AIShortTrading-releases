@@ -22,6 +22,7 @@ from src.research.insider_analysis import InsiderAnalyzer
 from src.research.competitor import CompetitorAnalyzer
 from src.research.market_cap import market_cap_tier_label
 from src.decision.risk_tier import build_risk_tier_prompt_section
+from src.research.ai_cost_tracker import AICostTracker, CostTrackingClient
 
 logger = logging.getLogger(__name__)
 
@@ -643,7 +644,15 @@ class ResearchEngine:
         self.competitor_analyzer = CompetitorAnalyzer(config)
 
         api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        self.client = anthropic.Anthropic(api_key=api_key) if api_key else None
+        _real_client = anthropic.Anthropic(api_key=api_key) if api_key else None
+        # AI-cost tracking (2026-08-26, owner request, ported from AITrading the
+        # same day) -- see ai_cost_tracker.py's own module docstring. Only ever
+        # wraps a REAL client, so `self.client` stays exactly None (not a truthy
+        # wrapper around None) when no API key is configured -- every existing
+        # `if not self.client:` check elsewhere in this file is unaffected.
+        self.cost_tracker = AICostTracker()
+        self.client = (CostTrackingClient(_real_client, self.cost_tracker)
+                       if _real_client else None)
 
         self.reports_dir = Path("data/research_reports")
         self.reports_dir.mkdir(parents=True, exist_ok=True)
@@ -1840,6 +1849,18 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 continue
 
             if result.result.type == "succeeded":
+                try:
+                    usage = getattr(result.result.message, "usage", None)
+                    if usage is not None:
+                        self.cost_tracker.record(
+                            getattr(result.result.message, "model", "unknown"),
+                            getattr(usage, "input_tokens", 0),
+                            getattr(usage, "output_tokens", 0),
+                            is_batch=True,
+                        )
+                except Exception as e:
+                    logger.debug("AI cost tracking failed for a batch result "
+                                 "(non-fatal): %s", e)
                 try:
                     text_block = next(
                         (b for b in result.result.message.content if hasattr(b, "text")), None)

@@ -746,6 +746,70 @@ def _on_deck_rr_above_gate(rr: float, required_rr: float) -> bool:
     return rr > required_rr
 
 
+def _on_shore_live_rr(entry_price: float, stop_loss: float, fair_value: float,
+                       live_price: float, default_stop_pct: float) -> float:
+    """Same free (no-Claude), live-quote R/R math get_today_scan_rejects already
+    computes for the On Shore tab itself (see that endpoint's own docstring) --
+    derives this stock's own stop % from Claude's last real entry/stop
+    recommendation, then re-applies that % to the CURRENT live price rather than
+    trusting the frozen entry_price a stale scan captured this morning. Shared
+    here (2026-08-26) so _backfill_on_deck_from_on_shore's new pre-AI-call gate
+    (see _on_shore_backfill_worth_ai_check) can't drift from the On Shore tab's
+    own already-proven live R/R formula. Short economics: the stop sits ABOVE
+    live_price (uses _short_derive_stop_pct, mirroring get_today_scan_rejects'
+    own short-side live_stop/risk/rr math exactly), reward is entry falling to
+    fair_value. Returns 0.0 for any missing/malformed input rather than raising
+    -- callers treat 0.0 as "not (yet) shortable"."""
+    if entry_price <= 0 or stop_loss <= 0 or fair_value <= 0 or live_price <= 0:
+        return 0.0
+    stop_pct = _short_derive_stop_pct(entry_price, stop_loss, default_stop_pct)
+    live_stop = live_price * (1 + stop_pct / 100)
+    risk = live_stop - live_price
+    if risk <= 0:
+        return 0.0
+    return (live_price - fair_value) / risk
+
+
+def _on_shore_backfill_worth_ai_check(
+        rr: float, required_rr: float, floor_margin, last_declined_rr) -> bool:
+    """True only if a FREE, no-Claude R/R check justifies spending a real
+    analyze_stock() call on this On Shore backfill candidate (2026-08-26,
+    cost-reduction redesign -- ported from AITrading the same day; see
+    _on_deck_backfill_declined_at_rr's own __init__ comment for the full live
+    incident this replaces, and _on_shore_live_rr's docstring for the short-side
+    R/R math feeding it). Direction-agnostic on purpose -- rr itself already
+    carries the correct short-side sign convention by construction (higher rr is
+    always a stronger setup, in both long and short economics), so this
+    comparison logic needs no mirroring of its own.
+
+    Two conditions, both required, mirroring the owner's own explicit design:
+    "i want it calculated the only time an ai call is made is after its found
+    to be buyable. then 1 ai call, if rejected that call is valid until
+    something changes in that stock to make it more likely is a buy... with
+    the absolute least amount of ai calls possible."
+
+    1. rr must already clear this candidate's own real gate on FREE data (the
+       same floor _on_deck_rr_floor_not_met already uses elsewhere in this
+       pipeline) -- a candidate that isn't even mechanically shortable yet gets
+       zero Claude spend, not a call every few minutes regardless.
+    2. If Claude already declined this exact ticker at some past free rr
+       level (last_declined_rr), rr must have risen to a genuine NEW HIGH
+       past that level -- not just any upward move. A margin-based
+       re-trigger was explicitly considered and rejected by the owner: "not
+       moved by a real margin, that could casue it to scan every minute
+       while it jumps up and down" -- a quote oscillating around one level
+       could cross a fixed margin repeatedly. Requiring a genuine new high
+       mirrors this codebase's own established _dip_low_changed_meaningfully
+       pattern (only a real new extreme re-opens a question Claude already
+       answered), just applied to a rising R/R.
+    """
+    if _on_deck_rr_floor_not_met(rr, required_rr, floor_margin):
+        return False
+    if last_declined_rr is not None and rr <= last_declined_rr:
+        return False
+    return True
+
+
 def _on_deck_rr_ceiling_exceeded(rr: float, required_rr: float, ceiling_margin: float) -> bool:
     """True if rr exceeds required_rr by more than ceiling_margin -- a small tolerance
     band a first-look candidate (no track record) is mechanically admitted within,
@@ -1843,6 +1907,20 @@ class DashboardState:
         # tend to resolve faster), is the more direct fix. In-memory only, same
         # not-worth-persisting-across-a-restart precedent as its two siblings above.
         self._on_deck_backfill_above_gate_cooldown: dict[str, datetime] = {}
+
+        # On Deck backfill free-R/R-gate decline memory (2026-08-26, cost-reduction
+        # redesign, ported from AITrading's own live incident the same day) -- see
+        # _on_shore_backfill_worth_ai_check's own docstring. A real, billed Claude
+        # call inside _backfill_on_deck_from_on_shore's _try_add_inner is now gated
+        # behind a FREE (live-quote, no-Claude) R/R pre-check, and once Claude has
+        # declined a candidate at a given free R/R level, that level is remembered
+        # here so a later attempt is only worth another real call once free R/R has
+        # risen to a genuine NEW HIGH past it -- not merely any move (owner
+        # explicitly rejected a margin-based re-trigger, since an oscillating quote
+        # could cross a fixed margin every minute). In-memory only, same
+        # not-worth-persisting-across-a-restart precedent as its siblings above --
+        # a restart simply re-earns one free "first look" per ticker.
+        self._on_deck_backfill_declined_at_rr: dict[str, float] = {}
 
         self.position_monitor_interval = research_cfg.get("position_monitor_interval_minutes", 60)
         self._is_holiday: bool = False
@@ -6976,6 +7054,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         population_floor = _on_deck_population_floor(min_conviction, conviction_band)
         today_str = self._now_et().strftime("%Y-%m-%d")
         held = set(self.portfolio.positions.keys())
+        default_stop_pct = self.config["take_profit"]["stop_loss_pct"]
 
         def _shore_score(d: dict) -> tuple[bool, float]:
             """Tiered ranking key (2026-07-31, XRAY-adjacent fix) -- see
@@ -7027,10 +7106,39 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             return
         candidates.sort(key=lambda kv: _shore_score(kv[1]), reverse=True)
 
-        async def _try_add_inner(ticker: str, log_prefix: str) -> bool:
+        async def _try_add_inner(ticker: str, d: dict, log_prefix: str) -> bool:
             """One fresh Claude re-check; adds to near_miss_candidates and returns True only
             if it still clears every gate on live data — never trusts the stale On Shore
-            snapshot that picked it as a candidate in the first place."""
+            snapshot that picked it as a candidate in the first place.
+
+            Gated behind a FREE (live-quote, no-Claude) R/R pre-check before ever spending
+            the real analyze_stock() call below (2026-08-26, cost-reduction redesign,
+            ported from AITrading) — see _on_shore_backfill_worth_ai_check's own docstring
+            and _on_deck_backfill_declined_at_rr's __init__ comment for the full incident
+            and design this replaces."""
+            try:
+                quote = await self.market_data.get_quote(ticker)
+                live_price = quote.price
+            except Exception:
+                live_price = 0.0
+            free_rr = _on_shore_live_rr(
+                d.get("entry_price", 0.0) or 0.0, d.get("stop_loss", 0.0) or 0.0,
+                d.get("fair_value_estimate", 0.0) or 0.0, live_price, default_stop_pct)
+            free_required_rr = _required_rr(
+                d.get("conviction", 0) or 0, min_conviction,
+                self.config["research"]["min_risk_reward_ratio"],
+                self.config["research"].get("on_deck_rr_conviction_step", 0.1),
+                self.config["research"].get("on_deck_rr_floor", 1.5))
+            floor_margin = self.config["research"].get("on_deck_rr_floor_margin")
+            last_declined = self._on_deck_backfill_declined_at_rr.get(ticker)
+            if not _on_shore_backfill_worth_ai_check(
+                    free_rr, free_required_rr, floor_margin, last_declined):
+                logger.debug(
+                    "%s: On Shore backfill skipped — free R/R %.2f doesn't clear its own "
+                    "gate (%.2f) or hasn't set a new high past the last AI decline (%s); "
+                    "no Claude call spent", ticker, free_rr, free_required_rr, last_declined)
+                return False
+
             try:
                 trade_history_summary = await self.portfolio.get_trade_history_summary(ticker)
                 analysis_history_summary = await self.portfolio.get_analysis_history_summary(ticker)
@@ -7053,6 +7161,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     "On Shore backfill candidate no longer qualifies on fresh data — "
                     f"{report.signal.value} | Conviction {report.conviction_score}/10", "warning")
                 await self.broadcast({"type": "ai_log", "entry": entry})
+                self._on_deck_backfill_declined_at_rr[ticker] = free_rr
                 return False
 
             rr_ok, rr_val, required_rr = self._passes_on_deck_rr_gate(report)
@@ -7063,6 +7172,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     f"< {required_rr + floor_margin:.2f} (its own gate {required_rr:.2f} + "
                     f"{floor_margin:.2f} margin)", "warning")
                 await self.broadcast({"type": "ai_log", "entry": entry})
+                self._on_deck_backfill_declined_at_rr[ticker] = free_rr
                 return False
             if _on_deck_rr_above_gate(rr_val, required_rr):
                 # Above its own gate -- ask the same shared AI judgment retention uses,
@@ -7092,6 +7202,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                         f"On Shore backfill candidate above its own gate — AI judged it's "
                         f"no longer a good short: {reasoning}", "warning")
                     await self.broadcast({"type": "ai_log", "entry": entry})
+                    self._on_deck_backfill_declined_at_rr[ticker] = free_rr
                     return False
 
             entry_dict = self._build_on_deck_entry(report, rr_val)
@@ -7108,6 +7219,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     "concurrent path while this re-check was in flight", ticker)
                 return False
             self.near_miss_candidates[ticker] = entry_dict
+            self._on_deck_backfill_declined_at_rr.pop(ticker, None)
             asyncio.create_task(self._maybe_auto_deep_dive(ticker, "ON_DECK"))
 
             status = "clears R/R now" if rr_ok else f"R/R {rr_val:.2f} < {required_rr:.2f} — watching"
@@ -7117,14 +7229,18 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             await self.broadcast({"type": "ai_log", "entry": entry})
             return True
 
-        async def _try_add(ticker: str, log_prefix: str) -> bool:
+        async def _try_add(ticker: str, d: dict, log_prefix: str) -> bool:
             """Wraps _try_add_inner with a reject cooldown (2026-08-03, owner request) --
             see _on_deck_backfill_reject_cooldown's own comment in __init__ for why. A
             failure here means this ticker was the top-ranked On Shore candidate but didn't
-            hold up on fresh data; without this, it's simply the top-ranked candidate again
-            next tick and gets re-tried immediately, real Claude spend, every 60s until it
-            either stabilizes or something else outranks it."""
-            ok = await _try_add_inner(ticker, log_prefix)
+            hold up on the free pre-check or fresh Claude data; without this, it's simply
+            the top-ranked candidate again next tick and gets re-tried immediately every
+            60s until it either stabilizes or something else outranks it -- cheap now that
+            most failures never spend a real Claude call at all (see _try_add_inner's own
+            free-R/R gate), but this cooldown still throttles the live-quote re-fetch
+            itself and remains the sole throttle on a real above-gate-unrelated AI decline
+            outside the two dedicated above-gate cooldowns."""
+            ok = await _try_add_inner(ticker, d, log_prefix)
             if not ok:
                 cooldown_min = self.config["research"].get(
                     "on_deck_backfill_retry_cooldown_minutes", 5)
@@ -7134,8 +7250,8 @@ Respond with ONLY the summary text, no preamble, no markdown."""
 
         open_slots = max_size - len(self.near_miss_candidates)
         if open_slots > 0:
-            for ticker, _ in candidates[:open_slots]:
-                await _try_add(ticker, "Backfilled to On Deck from On Shore (slot opened up)")
+            for ticker, d in candidates[:open_slots]:
+                await _try_add(ticker, d, "Backfilled to On Deck from On Shore (slot opened up)")
             asyncio.create_task(asyncio.to_thread(_save_on_deck_cache, dict(self.near_miss_candidates)))
             return
 
@@ -7156,7 +7272,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             return
 
         added = await _try_add(
-            challenger_ticker,
+            challenger_ticker, challenger_d,
             f"Swapped into On Deck from On Shore, replacing {weakest_ticker} (weaker-ranked)")
         if not added:
             return
@@ -8861,6 +8977,22 @@ async def get_about():
         "current_version": current,
         "releases": releases,
     }
+
+
+@app.get("/api/ai-cost-today")
+async def get_ai_cost_today():
+    """Backs the dashboard's live AI-cost widget (2026-08-26, owner request,
+    ported from AITrading the same day — see that project's CLAUDE_HISTORY.md
+    2026-08-26 entry for the $18/day cost-shock incident that prompted it).
+    Reads state.research_engine.cost_tracker's own already-running in-memory
+    summary — every real Claude call anywhere in this process (the sequential/
+    direct path via a transparent client wrapper, the Batch API path via
+    fetch_batch_results' own explicit recording) is already tracked as it
+    happens, so this endpoint is a cheap, zero-network-call read, safe to poll
+    frequently. See src/research/ai_cost_tracker.py's own module docstring for
+    the pricing basis and its "this is an ESTIMATE, not real billing" caveat."""
+    model = state.config.get("research", {}).get("model_quick_scan", "claude-haiku-4-5")
+    return state.research_engine.cost_tracker.summary(model_for_estimate=model)
 
 
 _INSTALL_ROOT = str(Path(__file__).resolve().parent.parent)
