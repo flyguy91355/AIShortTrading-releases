@@ -434,7 +434,7 @@ CURRENT PRICE: ${current_price:.2f}
 
 ── TECHNICAL CONTEXT ──
 {technical_summary}
-{market_context_section}{risk_tier_section}{long_term_trend_section}{sma_trend_section}{analysis_history_section}{trade_history_section}{user_note_section}
+{risk_tier_section}{long_term_trend_section}{sma_trend_section}{analysis_history_section}{trade_history_section}{user_note_section}
 Based on all of the above, provide your analysis as JSON with these exact fields:
 {{
     "conviction_score": <1-10, one decimal place, e.g. 7.3>,
@@ -488,38 +488,33 @@ def _build_long_term_trend_section(long_term_trend_summary: str) -> str:
 
 
 def _build_market_context_section(market_change_pct: float | None) -> str:
-    """Today's broad-market direction (S&P 500 proxy), with an explicit owner-directed
-    interpretive lean (2026-08-04, "shouldn't the AI know if the market's up or down"
-    discussion) -- every prompt in this system previously judged each stock in complete
-    isolation from what the broader market was doing that day. Returns "" when the fetch
-    failed (None), same graceful-omission pattern every other optional section here uses
-    -- never fabricates a market condition.
+    """DELIBERATELY RETIRED (2026-08-27, owner request: "if i dont need market
+    direction for buys and sells you can get rid of it") -- always returns "" now,
+    kept as a no-op stub rather than removed outright so every existing call site
+    (three real callers: _claude_analysis, submit_analysis_batch,
+    recommend_dip_entry) and every existing test can keep calling it unchanged.
 
-    Owner's explicit direction (inverted for short economics, 2026-08-19 -- see
-    AITrading's own version of this function for the original long-only lean this
-    mirrors), not left to open-ended AI judgment alone: a broadly down market should
-    generally be a favorable day to open new shorts (don't sit in cash waiting when the
-    fundamentals/technicals already support a short); a broadly up market calls for more
-    caution and selectivity, since a rising tide can squeeze a short regardless of the
-    individual stock's own weakness. Framed as a real, weighable factor alongside
-    everything else in the prompt, not a mechanical override -- consistent with this
-    project's standing preference for giving real data + framing and trusting Claude's
-    judgment rather than hardcoding a rule."""
-    if market_change_pct is None:
-        return ""
-    direction = "up" if market_change_pct >= 0 else "down"
-    return (
-        f"\n── TODAY'S MARKET ──\n"
-        f"S&P 500 (SPY): {market_change_pct:+.2f}% today — the broad market is {direction} "
-        f"today. Weigh this as a real factor: a stock's own price weakness on a day the "
-        f"broader market is also broadly down may partly reflect market-wide momentum "
-        f"(beta) rather than something unique to this company -- but a broadly down "
-        f"market is generally a favorable environment for opening new shorts, so don't be "
-        f"reflexively conservative if the fundamentals and technicals already support "
-        f"one. On a broadly up market, be more selective and cautious about new shorts, "
-        f"since a rising tide can squeeze a short position even in a genuinely weak "
-        f"stock.\n"
-    )
+    This function used to build a "TODAY'S MARKET" prompt section (S&P 500 %
+    change + an owner-directed interpretive lean) included in every single real
+    analysis prompt. Retired the same day a live investigation found this
+    account had executed ZERO real trades since going live (2026-08-19) --
+    tracing a separate, confirmed prompt bias (recommend_on_deck_retention's own
+    injected "real squeeze risk" phrasing, see that function's own docstring)
+    led here: this section's own "a rising tide can squeeze a short... be more
+    selective and cautious" framing was firing on literally every prompt on
+    every day the broad market was up -- which SPY had been, persistently, for
+    the entire zero-trade window. Unlike the retention-prompt fix (a clear,
+    unintended asymmetry vs. AITrading's neutral wording), this section's
+    language was a deliberate, owner-directed design choice from 2026-08-04 --
+    but given each stock's own TECHNICAL CONTEXT section already carries its own
+    real momentum/trend signal (RSI, SMA, support/resistance), a separate macro
+    overlay that leans toward caution more often than confidence (SPY trends up
+    more often than down over any extended window) was judged not worth the
+    real, demonstrated cost of adding one more "be cautious" lever without a
+    symmetric "be aggressive" one. Same change made in AITrading the same day
+    (this system's own long-only sibling had the identical section, mirrored
+    for long economics)."""
+    return ""
 
 
 # _market_cap_tier_label used to be defined here as its own standalone copy, with a
@@ -908,13 +903,13 @@ class ResearchEngine:
         prompt entirely when None/non-positive (unknown), same graceful-omission pattern
         peak_days_ago/low_days_ago already use.
 
-        Also fetches today's broad-market context (S&P 500 % change) via
-        _build_market_context_section -- same shared section analyze_stock's prompt
-        includes."""
+        Used to also fetch today's broad-market context (S&P 500 % change) here --
+        retired 2026-08-27 (owner request), see _build_market_context_section's own
+        docstring for the full removal rationale. That fetch is gone; the section
+        itself is now always "" via the no-op stub."""
         if not self.client:
             return None
-        market_change_pct = await self.market_data.get_market_change_pct()
-        market_context_section = _build_market_context_section(market_change_pct)
+        market_context_section = _build_market_context_section(None)
         _risk_tier_cfg = self.config.get("risk_tier", {})
         risk_tier_section = build_risk_tier_prompt_section(
             _risk_tier_cfg.get("value", 50.0), _risk_tier_cfg.get("mode", "auto"),
@@ -1496,10 +1491,11 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         re-examine a RECURRING candidate. See _build_analysis_history_section's own
         docstring.
 
-        market_change_pct (2026-08-04) -- today's S&P 500 % change, see
-        _build_market_context_section's docstring for the full "should the AI know if
-        the market's up or down" discussion. None (default) omits the section entirely,
-        same as every other optional context piece here.
+        market_change_pct (2026-08-04, retired 2026-08-27) -- kept as a parameter so
+        no caller's positional argument list needs renumbering, but the section it
+        used to build is now always omitted regardless of what's passed here -- see
+        _build_market_context_section's own docstring for the full removal
+        rationale.
 
         stop_tp_instructions (2026-07-31, AI-chosen stop-loss/TP feature) switches
         between the original fixed-percentage language and a real-technicals-judgment
@@ -1720,12 +1716,16 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         analysis_history_summary: str = "",
         sma_context: dict | None = None,
     ) -> ResearchReport:
-        market_change_pct = await self.market_data.get_market_change_pct()
+        # market_change_pct fetch retired 2026-08-27 (owner request) -- see
+        # _build_market_context_section's own docstring for the full removal
+        # rationale. Left as None (the parameter's own default) rather than
+        # dropped from the call entirely, so this positional call doesn't need
+        # every argument after it renumbered.
         prompt = self._build_quick_scan_prompt(
             ticker, company_name, current_price, fundamental_summary,
             insider_summary, news_summary, competitive_summary, technical_summary,
             trade_history_summary, long_term_trend_summary, user_note_summary,
-            market_change_pct, analysis_history_summary, sma_context,
+            None, analysis_history_summary, sma_context,
         )
         try:
             response_text = await self._call_claude_with_retry(
@@ -1850,12 +1850,10 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
         # long-standing model_pre_open_scan Settings-page dropdown dead (nothing ever read
         # it). Now the pre-open batch's own setting actually controls it.
         model = self.config.get("research", {}).get("model_pre_open_scan", "claude-haiku-4-5")
-        # Fetched once for the whole batch, not once per ticker (2026-08-04) -- a batch
-        # here can build 1,500+ prompts in one pass, and today's market direction is the
-        # same value for every one of them; get_market_change_pct's own short cache would
-        # naturally dedupe this anyway, but fetching it once up front avoids even the
-        # first-ticker's real network call being on this loop's critical path repeatedly.
-        market_change_pct = await self.market_data.get_market_change_pct()
+        # market_change_pct fetch retired 2026-08-27 (owner request) -- see
+        # _build_market_context_section's own docstring for the full removal
+        # rationale. This used to fetch it once for the whole batch (a batch here
+        # can build 1,500+ prompts in one pass); nothing left to fetch now.
         _history = analysis_history_summaries or {}
         _sma = sma_contexts or {}
         requests = []
@@ -1865,7 +1863,6 @@ not a one-liner>", "predicted_annual_return_pct": <signed number>, \
                 inp["fundamental_summary"], inp["insider_summary"],
                 inp["news_summary"], inp["competitive_summary"], inp["technical_summary"],
                 long_term_trend_summary=inp.get("long_term_trend_summary", ""),
-                market_change_pct=market_change_pct,
                 analysis_history_summary=_history.get(ticker, ""),
                 sma_context=_sma.get(ticker),
             )
