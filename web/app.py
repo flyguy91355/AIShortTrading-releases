@@ -30,6 +30,7 @@ from src.data.market_data import MarketDataFetcher
 from src.data.insider_tracker import InsiderTracker
 from src.data.news_feed import NewsFeed
 from src.research.engine import ResearchEngine, _clamp_ai_stop_loss
+from src.research.market_cap import market_cap_tier_label as _market_cap_tier_label
 from src.research.fundamental import FundamentalAnalyzer
 from src.research.sentiment import SentimentAnalyzer
 from src.research.insider_analysis import InsiderAnalyzer
@@ -876,6 +877,57 @@ def _sma_crossover_too_stale(days_since_crossover: int | None, max_age_days: int
     staleness against; that case is left to the AI's own existing "sustained,
     longer-standing state" framing, unchanged."""
     return days_since_crossover is not None and days_since_crossover > max_age_days
+
+
+_SMA_MAX_AGE_TIER_MULTIPLIERS = {
+    "mega-cap": 1.3,
+    "large-cap": 1.0,
+    "mid-cap": 0.8,
+    "small-cap": 0.6,
+}
+
+
+def _sma_max_age_days_for_market_cap(market_cap: float, base_max_age_days: float) -> int:
+    """Scales the Stage 2 staleness ceiling (_sma_crossover_too_stale's own
+    max_age_days) by company size (2026-08-27, owner request, ported from AITrading
+    the same day: "large cap 21 days is fine.. but a small cap that runs faster 21
+    day may be too long"). A large, steady company's support/resistance/trend
+    levels reasonably persist longer than a small, volatile one's -- the exact same
+    reasoning recommend_dip_entry's own market-cap-aware staleness judgment already
+    applies (see market_cap_tier_label's docstring), just as a MECHANICAL scale
+    here rather than handed to the AI, matching this ceiling's own existing "hard
+    mechanical exclude, no AI call" design instead of turning it into a second
+    AI-judged decision.
+
+    Multipliers are grounded in real historical volatility data, not guessed
+    (owner explicitly asked for researched numbers on AITrading the same day, not
+    intuition -- "i need you to research for the best numbers... dont go by my
+    example either"): individual small-cap stocks (<$2B) have averaged ~22%
+    annualized volatility against ~13% for large-cap (>$10B) -- a ~1.69x ratio --
+    while the S&P MidCap 400 has run roughly 15-25% more volatile than the S&P 500
+    (~1.15-1.25x) over its history; mega-caps are consistently documented as the
+    least volatile tier of the three, though without an equally precise ratio
+    available. Staleness should scale INVERSELY with volatility (a faster-moving
+    stock invalidates a trend signal sooner), so each multiplier is roughly the
+    reciprocal of that tier's volatility ratio to large-cap: mid-cap 0.8x
+    (~1/1.2), small-cap 0.6x (~1/1.69, rounded up slightly rather than down, since
+    a hard hidden exclusion is a worse failure mode than a slightly generous one),
+    mega-cap 1.3x (a moderate upweight reflecting the qualitative "least volatile
+    of all three tiers" finding). See AITrading's docs/CLAUDE_HISTORY.md's
+    2026-08-27 entry for the full source list.
+
+    Deliberately mechanical, not a second Claude call -- market_cap is already
+    fetched for free at this same call site (_fetch_sma_context_if_qualifying, for
+    the prompt's own SMA context), so scaling off it costs nothing extra. Uses the
+    real `research.sma_crossover_max_age_days` setting as the large-cap anchor
+    (multiplier 1.0, so an unchanged Settings value behaves exactly as before this
+    feature existed) rather than a second, independent setting that could drift
+    from it. Unknown/non-positive market cap (a failed get_financials() lookup)
+    falls back to the unscaled base value, matching this codebase's fail-open
+    convention for market-data gaps."""
+    tier = _market_cap_tier_label(market_cap)
+    multiplier = _SMA_MAX_AGE_TIER_MULTIPLIERS.get(tier, 1.0)
+    return round(base_max_age_days * multiplier)
 
 
 def _sma_near_crossover(sma_50: float, sma_200: float, price: float, threshold_pct: float) -> bool:
@@ -5516,8 +5568,16 @@ class DashboardState:
                         cooldown_min = self.config["research"].get(
                             "on_deck_above_gate_recheck_cooldown_minutes", 30)
                         now_et = self._now_et()
+                        # 2026-08-27, owner request, ported from AITrading the same day
+                        # -- no cash above the reserve floor means there's nothing to
+                        # promote this candidate INTO regardless of the verdict, so
+                        # skip the real Claude call the same way an active cooldown
+                        # already does (no eviction, no new cooldown set -- once cash
+                        # frees up this re-checks on the very next tick rather than
+                        # waiting out a stale cooldown window).
                         due = not (
-                            _on_deck_cooldown_active(self._on_deck_above_gate_cooldown, ticker, now_et)
+                            self._no_buying_capacity()
+                            or _on_deck_cooldown_active(self._on_deck_above_gate_cooldown, ticker, now_et)
                             or _on_deck_cooldown_active(
                                 self._on_deck_backfill_above_gate_cooldown, ticker, now_et))
                         if due:
@@ -5683,7 +5743,14 @@ class DashboardState:
                         if (nm.get("direction") == "down" and nm.get("streak", 0) >= 2
                                 and not nm.get("ai_entry_pending")
                                 and peak_changed
-                                and not self._past_auto_buy_cutoff()):
+                                and not self._past_auto_buy_cutoff()
+                                and not self._no_buying_capacity()):
+                            # 2026-08-27, owner request -- no cash above the reserve
+                            # floor means there's nothing to short into regardless of
+                            # what price this call would recommend, so skip it the
+                            # same way. Also deliberately does not set ai_entry_pending
+                            # -- see below.
+                            #
                             # Skip firing this real, paid Claude call once past today's
                             # auto-buy cutoff (2026-08-27, ported from AITrading's own
                             # MGY incident the same day) -- the buy-trigger check inside
@@ -5970,9 +6037,31 @@ class DashboardState:
             self.config["risk_management"]["min_cash_reserve_pct"] / 100)
         return cash - reserved - position_size < required_reserve
 
+    def _no_buying_capacity(self) -> bool:
+        """True when there is zero realistic room for ANY new position -- cash is
+        already at or below the reserve floor (2026-08-27, owner request, ported
+        from AITrading the same day: "when there is not enough cash to buy
+        anything.. i want all scans stopped except for necessary ones"). Reuses
+        _cash_reserve_insufficient with a $0 position size, so this can never
+        disagree with the real per-candidate cash checks elsewhere -- same
+        reserve-floor formula, just asking whether there's room for a position of
+        ANY size rather than one specific candidate's.
+
+        Used to skip AI calls whose only purpose is enabling or pricing a
+        brand-new position when there's structurally no way to act on the
+        result: the On Deck backfill/swap loop, the continuous above-gate
+        re-judgment, the dip-entry pricing call, and the auto deep-dive on new
+        On Deck entries. Deliberately NOT applied to the pre-open/mid-day
+        universe scans (still necessary to have a fresh candidate pool ready
+        for whenever cash frees up), the On Deck persist-check re-vet (runs as
+        a sub-step of those same scans, not a separate cost), or sell
+        post-mortems (about already-closed trades, cash-irrelevant by
+        design)."""
+        return self._cash_reserve_insufficient(self.portfolio.cash, 0.0)
+
     async def _attempt_near_miss_promotion(
         self, ticker: str, nm_snapshot: dict | None = None, dip_low: float | None = None,
-        sma_context: dict | None = None,
+        sma_context: dict | None = None, prefetched_report=None,
     ):
         """Fired when a candidate clears R/R + a confirmed downtick. Runs one fresh Claude
         re-analysis (pre-open data can be hours old) and, if it still passes every normal buy
@@ -5981,6 +6070,15 @@ class DashboardState:
         now the sole buy path (2026-07-17) — if the portfolio is full, attempts a rotation
         swap against the weakest current holding (same pattern _buy_from_watchlist_by_price
         used to use) rather than skipping outright.
+
+        `prefetched_report` (2026-08-27, Track 1/Track 2 merge, ported from AITrading the
+        same day) -- when set, skips this function's own internal analyze_stock()
+        re-analysis entirely and uses the given report as-is. Every gate below this point
+        (conviction/signal/entry/stop, R/R + the Track 2 override, sector concentration,
+        drawdown, cash) is unchanged -- only WHERE the report comes from changes. Exists
+        so a candidate whose SMA trend context was already folded into its normal
+        universe-scan analysis (see _process_universe_scan_result) doesn't pay for a
+        second, redundant Claude call just to re-derive the same judgment moments later.
 
         `nm_snapshot` (2026-07-20) — the candidate's dict as it was the instant this attempt
         fired, popped from near_miss_candidates by the caller before this coroutine started.
@@ -6046,6 +6144,21 @@ class DashboardState:
                 await _fail_gate(
                     f"R/R + rollover confirmed but past {_cutoff_str} ET cutoff — skipping",
                     f"Past {_cutoff_str} ET cutoff")
+                return
+
+            # Blanket no-capacity gate (2026-08-27, owner request, ported from AITrading
+            # the same day) — checked before the per-candidate cash pre-check below, and
+            # before prefetched_report skips the real re-analysis call, since this covers
+            # the case that check misses: it only fires when nm_snapshot has a cached
+            # price/stop, which is never true for a prefetched-report call (see
+            # prefetched_report's own docstring) or a brand-new candidate with no prior
+            # snapshot at all. Free, no-Claude check — if cash is already at/below the
+            # reserve floor, no candidate of any size could pass the real cash check
+            # further down regardless of what a fresh re-analysis would say.
+            if self._no_buying_capacity():
+                await _fail_gate(
+                    "Skipped — no cash above the reserve floor for any new position",
+                    "No buying capacity")
                 return
 
             # Wash-sale rebuy block (2026-07-27) — pure in-memory dict lookup (see
@@ -6134,20 +6247,29 @@ class DashboardState:
                     f"Earnings blackout ({earnings_date})")
                 return
 
-            entry = self.add_ai_log(ticker, "ON_DECK",
-                "R/R recovered + confirmed downtick — running fresh analysis...", "info")
-            await self.broadcast({"type": "ai_log", "entry": entry})
+            if prefetched_report is not None:
+                # Track 1/Track 2 merge (2026-08-27, ported from AITrading the same
+                # day) -- this candidate's SMA trend context was already folded into
+                # its normal universe-scan analysis (see _process_universe_scan_result),
+                # so there's a real, current report in hand already. Skip the second
+                # Claude call entirely rather than re-deriving the identical judgment
+                # moments later.
+                report = prefetched_report
+            else:
+                entry = self.add_ai_log(ticker, "ON_DECK",
+                    "R/R recovered + confirmed downtick — running fresh analysis...", "info")
+                await self.broadcast({"type": "ai_log", "entry": entry})
 
-            try:
-                trade_history_summary = await self.portfolio.get_trade_history_summary(ticker)
-                analysis_history_summary = await self.portfolio.get_analysis_history_summary(ticker)
-                report = await self.research_engine.analyze_stock(
-                    ticker, trade_history_summary, self.on_deck_notes.get(ticker, ""),
-                    analysis_history_summary=analysis_history_summary,
-                    sma_context=sma_context)
-            except Exception as e:
-                await _fail_gate(f"Re-analysis failed: {e}", f"Re-analysis failed: {e}", level="error")
-                return
+                try:
+                    trade_history_summary = await self.portfolio.get_trade_history_summary(ticker)
+                    analysis_history_summary = await self.portfolio.get_analysis_history_summary(ticker)
+                    report = await self.research_engine.analyze_stock(
+                        ticker, trade_history_summary, self.on_deck_notes.get(ticker, ""),
+                        analysis_history_summary=analysis_history_summary,
+                        sma_context=sma_context)
+                except Exception as e:
+                    await _fail_gate(f"Re-analysis failed: {e}", f"Re-analysis failed: {e}", level="error")
+                    return
 
             min_conviction = self.config["research"]["min_conviction_score"]
             base_rr = self.config["research"]["min_risk_reward_ratio"]
@@ -6664,6 +6786,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
     async def _run_batched_chunk_loop(
         self, chunk_source, on_result, should_stop=None,
         analysis_history_summaries: dict[str, str] | None = None,
+        sma_contexts: dict[str, dict] | None = None,
     ):
         """Adaptive Batch-API chunk orchestrator shared by pre-open Phase 1 (watchlist
         re-vet — a static pre-sliced chunk source) and Phase 2 (universe fill — a chunk
@@ -6730,6 +6853,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             Pause/Stop now breaks out within one ticker instead of requiring a
             restart to actually take effect."""
             _history = analysis_history_summaries or {}
+            _sma = sma_contexts or {}
             for ticker in chunk:
                 if self.paused or self.stopped or should_stop():
                     logger.info(
@@ -6738,7 +6862,8 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     return
                 try:
                     report = await self.research_engine.analyze_stock(
-                        ticker, analysis_history_summary=_history.get(ticker, ""))
+                        ticker, analysis_history_summary=_history.get(ticker, ""),
+                        sma_context=_sma.get(ticker))
                     if getattr(report, "is_account_locked", False):
                         # A hard, account-wide Claude API lockout (2026-08-25, ported
                         # from AITrading's own live incident the same day) -- every
@@ -6770,7 +6895,8 @@ Respond with ONLY the summary text, no preamble, no markdown."""
 
         async def _run_one_batch(chunk: list[str]) -> float | None:
             batch_id, inputs_by_ticker = await self.research_engine.submit_analysis_batch(
-                chunk, analysis_history_summaries=analysis_history_summaries)
+                chunk, analysis_history_summaries=analysis_history_summaries,
+                sma_contexts=sma_contexts)
             if not batch_id:
                 logger.warning(
                     "Batch submission produced no batch_id for a %d-ticker chunk — "
@@ -7111,6 +7237,14 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         max_size = self.config["research"].get("on_deck_max_size", 0)
         if not max_size:
             return
+        if self._no_buying_capacity():
+            # 2026-08-27, owner request, ported from AITrading the same day -- this
+            # whole function exists purely to keep On Deck full/best-ranked for
+            # shorting; with zero cash above the reserve floor there's structurally
+            # no chance of acting on anything it would find, so skip the real
+            # Claude re-check(s) entirely (both the open-slot fill and the
+            # weakest-member swap) rather than paying for them.
+            return
 
         min_conviction = self.config["research"]["min_conviction_score"]
         conviction_band = self.config["research"].get("on_deck_conviction_band", 0.0)
@@ -7402,6 +7536,12 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         if not self.config["research"].get("on_deck_auto_deep_dive", True):
             return
         if not buy_eligible:
+            return
+        if self._no_buying_capacity():
+            # 2026-08-27, owner request, ported from AITrading the same day -- this is
+            # display polish for a candidate that might get shorted soon; with no
+            # cash above the reserve floor there's nothing for it to prepare for, so
+            # skip the extra Claude spend.
             return
         today_str = self._now_et().strftime("%Y-%m-%d")
         if self._auto_deep_dive_count_date != today_str:
@@ -7839,6 +7979,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
 
     async def _process_universe_scan_result(
         self, ticker: str, report, phase_tag: str, population_floor: float,
+        sma_context: dict | None = None,
     ) -> bool:
         """Shared per-ticker result processing for any universe-scan-style Claude
         analysis pass (2026-07-31) -- persists the report, applies the standard On
@@ -7849,7 +7990,23 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         instead of maintaining a second copy that could drift -- the same "duplicated
         logic drifts" lesson as the population-floor and composite-score fixes earlier
         the same day (see CLAUDE.md). Returns True if the candidate was added to On
-        Deck, False otherwise (caller tracks its own added-count)."""
+        Deck, False otherwise (caller tracks its own added-count).
+
+        sma_context (2026-08-27, Track 1/Track 2 merge, ported from AITrading the same
+        day) -- when the caller determined this ticker mechanically qualified for a
+        confirmed SMA cross (see _fetch_sma_context_if_qualifying) and folded that
+        context into THIS report's own prompt, a normal-gate rejection specifically
+        caused by R/R falling short of the gate (not signal/conviction/fair-value,
+        which Track 2's override never waives) gets one more chance: if
+        report.trend_confirms_entry came back true, attempt a promotion using this
+        SAME already-paid-for report (_attempt_near_miss_promotion's prefetched_report
+        parameter) instead of just dropping to On Shore -- no second Claude call."""
+        async def _maybe_track2_override() -> None:
+            if sma_context is None or not getattr(report, "trend_confirms_entry", False):
+                return
+            await self._attempt_near_miss_promotion(
+                ticker, sma_context=sma_context, prefetched_report=report)
+
         if getattr(report, "is_fallback", True):
             entry = self.add_ai_log(ticker, phase_tag, "AI unavailable — skipping", "warning")
             await self.broadcast({"type": "ai_log", "entry": entry})
@@ -7890,6 +8047,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 f"R/R {rr_val:.2f} below min R/R floor ({required_rr + floor_margin:.2f}, "
                 f"its own gate {required_rr:.2f} + {floor_margin:.2f} margin)", "neutral")
             await self.broadcast({"type": "ai_log", "entry": entry})
+            await _maybe_track2_override()
             return False
 
         ceiling_margin = self.config["research"].get("on_deck_rr_ceiling_margin", 0.15)
@@ -7907,6 +8065,14 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 f"its own gate {required_rr:.2f} + {ceiling_margin:.2f} margin) on first look",
                 "neutral")
             await self.broadcast({"type": "ai_log", "entry": entry})
+            # Deliberately no Track 2 override attempt here (unlike the floor-not-met
+            # branch above, ported from AITrading the same day) -- an above-ceiling R/R
+            # is a population-filter exclusion, not something the override was ever
+            # designed to waive (it only ever waives rr < min_rr, never a ceiling), and
+            # _attempt_near_miss_promotion's own buy-decision R/R check has no ceiling
+            # at all -- routing this candidate through would risk buying on the exact
+            # "R/R inflated by a tightened stop, not a genuinely better setup" pattern
+            # the ceiling exclusion exists to catch.
             return False
 
         entry_dict = self._build_on_deck_entry(report, rr_val)
@@ -7976,9 +8142,13 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             already_covered = 0
             scanned = 0
 
+            sma_contexts: dict[str, dict] = {}
+
             async def _on_result(ticker: str, report) -> None:
                 nonlocal added
-                if await self._process_universe_scan_result(ticker, report, tag, population_floor):
+                if await self._process_universe_scan_result(
+                        ticker, report, tag, population_floor,
+                        sma_context=sma_contexts.get(ticker)):
                     added += 1
 
             async def _chunks():
@@ -8016,6 +8186,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                         screened_out += 1
                         continue
 
+                    sma_context = await self._fetch_sma_context_if_qualifying(ticker, sma_50, sma_200)
+                    if sma_context is not None:
+                        sma_contexts[ticker] = sma_context
+
                     buffer.append(ticker)
                     if len(buffer) >= 100:
                         yield buffer
@@ -8026,7 +8200,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             if self.paused or self.stopped:
                 logger.info("Mid-day re-scan skipped — %s", self.run_status())
             else:
-                await self._run_batched_chunk_loop(_chunks(), _on_result)
+                await self._run_batched_chunk_loop(_chunks(), _on_result, sma_contexts=sma_contexts)
 
             trimmed = await self._enforce_on_deck_cap(tag)
 
@@ -8045,17 +8219,79 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         finally:
             self._midday_rescan_in_progress = False
 
+    async def _fetch_sma_context_if_qualifying(
+        self, ticker: str, sma_50: float | None, sma_200: float | None,
+    ) -> dict | None:
+        """Stage 1 + Stage 2 of the SMA Trend-Confirmation Track's CONFIRMED-cross
+        case only (2026-08-27, Track 1/Track 2 merge, ported from AITrading the same
+        day -- see _run_pre_open_batch's own chunk-building loop, the sole real
+        caller). Extracted from what used to be _run_sma_trend_scan's own inline
+        confirmed-cross branch, unchanged in logic -- Stage 1
+        (_sma_death_cross_qualifies, free/mechanical) gates whether Stage 2
+        (get_sma_crossover_info, a real crossover-date lookup) runs at all, and a
+        stale crossover (_sma_crossover_too_stale) is excluded before ever building a
+        context dict. Returns None whenever the ticker doesn't mechanically qualify
+        or its crossover is too stale -- the caller folds a real dict straight into
+        that SAME ticker's normal universe-scan prompt (see submit_analysis_batch's
+        own sma_contexts parameter), instead of this candidate needing a second,
+        separate Claude call later (the old Track 2 design) just to add it.
+
+        Deliberately does NOT cover the "approaching a cross" sub-case -- that one
+        needs a live price to compute its gap percentage, which isn't available yet
+        at this point in the universe-scan chunk-building loop (only quick_screen's
+        free SMA data is). _run_sma_trend_scan (below) still runs as a separate,
+        smaller pass for that sub-case only, scoped to On Shore (a ticker's own
+        current-day price is already cached there by the time it's checked).
+
+        Fetches market_cap BEFORE the staleness check (2026-08-27, owner request,
+        ported from AITrading the same day: "large cap 21 days is fine.. but a
+        small cap that runs faster 21 day may be too long") -- reordered from the
+        original design so the real research.sma_crossover_max_age_days setting
+        can be tier-scaled by company size (_sma_max_age_days_for_market_cap)
+        before deciding staleness, not just carried through unscaled to the prompt
+        afterward. Zero extra cost: this fetch already happened here regardless,
+        just later, for the prompt's own market_cap field."""
+        if sma_50 is None or sma_200 is None or not _sma_death_cross_qualifies(sma_50, sma_200):
+            return None
+        lookback_days = self.config["research"].get("sma_crossover_lookback_days", 252)
+        base_max_age_days = self.config["research"].get("sma_crossover_max_age_days", 21)
+        try:
+            financials = await self.market_data.get_financials(ticker)
+            market_cap = getattr(financials, "market_cap", 0.0)
+        except Exception:
+            market_cap = 0.0
+        max_age_days = _sma_max_age_days_for_market_cap(market_cap, base_max_age_days)
+        crossover_info = await self.market_data.get_sma_crossover_info(
+            ticker, direction="below", lookback_days=lookback_days)
+        if _sma_crossover_too_stale(crossover_info.days_since_crossover, max_age_days):
+            return None
+        return {
+            "sma_50": crossover_info.sma_50 or sma_50,
+            "sma_200": crossover_info.sma_200 or sma_200,
+            "crossover_date": crossover_info.crossover_date,
+            "days_since_crossover": crossover_info.days_since_crossover,
+            "market_cap": market_cap,
+        }
+
     async def _run_sma_trend_scan(self, source_label: str = "PRE-OPEN"):
         """Track 2 of the buy pipeline (2026-08-24 design,
         docs/superpowers/specs/2026-08-24-sma-trend-confirmation-track-design.md) --
         an independent, additive path alongside Track 1 (the existing R/R-gated
-        watch-and-promote mechanism, completely untouched by this function). Looks
-        for stocks already showing a confirmed death cross (SMA50 < SMA200) and
-        sends only those through a real analyze_stock() call with SMA context,
-        skipping Track 1's extended watch-and-wait holding period entirely -- a
+        watch-and-promote mechanism, completely untouched by this function). A
         qualifying candidate goes straight to _attempt_near_miss_promotion with
         sma_context set, which can then short even when R/R doesn't clear its usual
         gate (see _track2_rr_override_applies).
+
+        Narrowed to the "approaching a death cross" sub-case only (2026-08-27,
+        Track 1/Track 2 merge, ported from AITrading the same day) -- the
+        CONFIRMED-cross case (a stock already showing SMA50 < SMA200) is now folded
+        directly into Track 1's own normal universe-scan analysis via
+        _fetch_sma_context_if_qualifying, called inline from
+        _run_pre_open_batch's/_run_midday_rescan's own chunk-building loops, so a
+        confirmed-cross candidate never needs this SECOND, separate Claude call at
+        all anymore. This function's remaining job -- "not yet crossed, but close" --
+        genuinely needs a live price to compute its gap percentage, which the main
+        scan's chunk-building loop doesn't have yet.
 
         Runs as its own guarded pass (self._sma_trend_scan_in_progress) so a slow
         run can't overlap itself -- deliberately does NOT share
@@ -8091,17 +8327,13 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             return
         self._sma_trend_scan_in_progress = True
         try:
-            lookback_days = self.config["research"].get("sma_crossover_lookback_days", 252)
-            max_age_days = self.config["research"].get("sma_crossover_max_age_days", 21)
             near_threshold_pct = self.config["research"].get("sma_near_crossover_threshold_pct", 2.0)
             checked = 0
-            stage1_qualified = 0
-            too_stale = 0
             near_crossover = 0
             attempted = 0
 
             entry = self.add_ai_log("SYSTEM", source_label,
-                "SMA trend-confirmation scan (Track 2) starting...", "info")
+                "SMA trend-confirmation scan (Track 2, approaching-cross only) starting...", "info")
             await self.broadcast({"type": "ai_log", "entry": entry})
 
             for ticker in self._on_shore_tickers():
@@ -8113,36 +8345,12 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 sma_50, sma_200 = cached
                 checked += 1
 
+                # A confirmed cross (SMA50 < SMA200) is no longer this function's job
+                # -- Track 1's own scan already checked and, if it qualified, folded
+                # SMA context straight into that ticker's normal analysis (see
+                # _fetch_sma_context_if_qualifying). Only "not yet crossed, but
+                # close" candidates reach this point.
                 if _sma_death_cross_qualifies(sma_50, sma_200):
-                    stage1_qualified += 1
-
-                    crossover_info = await self.market_data.get_sma_crossover_info(
-                        ticker, direction="below", lookback_days=lookback_days)
-
-                    if _sma_crossover_too_stale(crossover_info.days_since_crossover, max_age_days):
-                        too_stale += 1
-                        continue
-
-                    try:
-                        financials = await self.market_data.get_financials(ticker)
-                        market_cap = getattr(financials, "market_cap", 0.0)
-                    except Exception:
-                        market_cap = 0.0
-
-                    sma_context = {
-                        "sma_50": crossover_info.sma_50 or sma_50,
-                        "sma_200": crossover_info.sma_200 or sma_200,
-                        "crossover_date": crossover_info.crossover_date,
-                        "days_since_crossover": crossover_info.days_since_crossover,
-                        "market_cap": market_cap,
-                    }
-
-                    attempted += 1
-                    entry = self.add_ai_log(ticker, source_label,
-                        "SMA death cross confirmed — running Track 2 trend-confirmation analysis...",
-                        "info")
-                    await self.broadcast({"type": "ai_log", "entry": entry})
-                    await self._attempt_near_miss_promotion(ticker, sma_context=sma_context)
                     continue
 
                 # Not yet crossed -- check whether it's close enough to be worth a
@@ -8155,6 +8363,9 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 if not _sma_near_crossover(sma_50, sma_200, cached_price, near_threshold_pct):
                     continue
                 near_crossover += 1
+
+                if self._no_buying_capacity():
+                    continue
 
                 try:
                     financials = await self.market_data.get_financials(ticker)
@@ -8180,9 +8391,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
 
             entry = self.add_ai_log("SYSTEM", source_label,
                 f"SMA trend-confirmation scan complete — {checked:,} tickers checked, "
-                f"{stage1_qualified} in a death cross, {too_stale} too stale "
-                f"(crossed >{max_age_days}d ago), {near_crossover} approaching a cross, "
-                f"{attempted} sent for analysis.",
+                f"{near_crossover} approaching a cross, {attempted} sent for analysis.",
                 "success")
             await self.broadcast({"type": "ai_log", "entry": entry})
         finally:
@@ -8264,8 +8473,21 @@ Respond with ONLY the summary text, no preamble, no markdown."""
 
         async def _on_result(ticker: str, report) -> None:
             nonlocal added
-            if await self._process_universe_scan_result(ticker, report, source_label, population_floor):
+            if await self._process_universe_scan_result(
+                    ticker, report, source_label, population_floor,
+                    sma_context=sma_contexts.get(ticker)):
                 added += 1
+
+        # Track 1/Track 2 merge (2026-08-27, ported from AITrading the same day, owner
+        # request: "that's could be combined into 1 ai call, not 2") -- keyed by ticker,
+        # populated inline below for any survivor whose free SMA data (Stage 1)
+        # mechanically qualifies. Passed through to _run_batched_chunk_loop so a
+        # qualifying candidate's normal universe-scan analysis already carries the SMA
+        # trend section, instead of needing a second, separate Claude call later (the
+        # old _run_sma_trend_scan design) just to add it. See
+        # _fetch_sma_context_if_qualifying's own docstring for the Stage 1/Stage 2
+        # sequencing and why only the confirmed-cross case is handled here.
+        sma_contexts: dict[str, dict] = {}
 
         async def _chunks():
             nonlocal screened_out, scanned
@@ -8304,6 +8526,10 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                     screened_out += 1
                     continue
 
+                sma_context = await self._fetch_sma_context_if_qualifying(ticker, sma_50, sma_200)
+                if sma_context is not None:
+                    sma_contexts[ticker] = sma_context
+
                 buffer.append(ticker)
                 if len(buffer) >= 100:
                     yield buffer
@@ -8322,7 +8548,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
         if self.paused or self.stopped:
             logger.info("Pre-open scan skipped — %s", self.run_status())
         else:
-            await self._run_batched_chunk_loop(_chunks(), _on_result)
+            await self._run_batched_chunk_loop(_chunks(), _on_result, sma_contexts=sma_contexts)
 
         trimmed = await self._enforce_on_deck_cap(source_label)
 
