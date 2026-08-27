@@ -1273,7 +1273,26 @@ Respond with ONLY a JSON object:
         the caller must treat this as "keep, don't evict" (same AI Data Integrity
         principle as every other real trading figure in this codebase: never remove a
         candidate on missing/failed AI data). Uses model_dip_entry (shared with the
-        thematically similar dip-entry judgment above, not a new dedicated dial)."""
+        thematically similar dip-entry judgment above, not a new dedicated dial).
+
+        Prompt de-biased 2026-08-27, owner incident ("no reason for no action in over
+        a week") -- a direct comparison against AITrading's own copy of this exact
+        prompt found this version had a real, one-sided asymmetry AITrading's never
+        had: the decline-framing half of the judgment paragraph parenthetically
+        injected "(price has run up close to the stop, real squeeze risk)" directly
+        into the question, pre-labeling the negative case with a specific, alarming
+        technical term rather than leaving Claude to weigh severity on its own. Live
+        audit of every real above-gate verdict this system had ever logged (162 of
+        them) found a 0% acceptance rate -- not one "yes" ever -- versus ~13% on
+        AITrading's differently-worded copy over a comparable window. Reading the
+        actual declined reasoning confirmed the primed phrase: nearly every real
+        verdict echoed "squeeze risk" back almost verbatim, regardless of how
+        different the underlying tickers/setups were. Reworded to match AITrading's
+        neutral framing exactly (just direction-mirrored for short economics) --
+        "squeeze" is still a real, legitimate short-specific risk and remains
+        elsewhere in this file's other prompts (CATALYSTS/RISK FACTORS sections,
+        macro sensitivity) where it's asked for as one factor among several, not
+        pre-injected as the conclusion of a binary judgment call."""
         if not self.client:
             return None
         prompt = f"""\
@@ -1295,11 +1314,10 @@ inflates this ratio (a bigger gap down to fair value, a smaller gap up to the st
 without any real improvement in the setup.
 
 Judge whether this is still a genuine, worthwhile short opportunity right now, or
-whether the elevated ratio reflects an overextended situation (price has run up close
-to the stop, real squeeze risk) that's no longer a good short. Weigh whether the
-original short thesis still holds and whether the price action looks like continued
-genuine overvaluation versus the stock simply approaching the stop before it's likely
-to reverse.
+whether the elevated ratio reflects an overextended or deteriorating situation that's
+no longer a good short. Weigh whether the original short thesis still holds and
+whether the price action looks like continued genuine overvaluation versus a real
+reversal.
 
 Respond with ONLY a JSON object:
 {{"still_good_buy": true/false, "reasoning": "<a detailed 2-4 sentence explanation --
