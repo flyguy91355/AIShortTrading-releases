@@ -4669,16 +4669,20 @@ class DashboardState:
                 stop_loss = report.stop_loss
                 take_profits = list(report.take_profit_targets)
             else:
+                # Short economics: stop sits ABOVE current price, take-profit targets
+                # sit BELOW it (profit comes from price falling) -- fixed 2026-08-28,
+                # audit finding. This admin-only migration fallback had never been
+                # updated to this project's own short-direction convention.
                 tp_cfg = self.config.get("take_profit", {})
                 sl  = tp_cfg.get("stop_loss_pct", 7.0)  / 100
                 t1p = tp_cfg.get("t1_pct",  5.0)  / 100
                 t2p = tp_cfg.get("t2_pct", 10.0)  / 100
                 t3p = tp_cfg.get("t3_pct", 17.0)  / 100
-                stop_loss = round(current_price * (1 - sl), 2)
+                stop_loss = round(current_price * (1 + sl), 2)
                 take_profits = [
-                    round(current_price * (1 + t1p), 2),
-                    round(current_price * (1 + t2p), 2),
-                    round(current_price * (1 + t3p), 2),
+                    round(current_price * (1 - t1p), 2),
+                    round(current_price * (1 - t2p), 2),
+                    round(current_price * (1 - t3p), 2),
                 ]
 
             # Rebuy notionally for the same dollar amount
@@ -6675,10 +6679,16 @@ class DashboardState:
                 _refresh_nm_from_report(rr_val=rr, required_rr_val=min_rr)
                 return
 
+            # Short economics: take-profit targets sit BELOW entry (profit comes
+            # from price falling), so this fallback multiplies by (1 - pct), not
+            # (1 + pct) -- fixed 2026-08-28, audit finding. (1 + pct) is the
+            # long-only direction and was never flipped when this fallback was
+            # written; the empty-take_profit_targets case that reaches it is a
+            # real, if uncommon, parsing edge case, not dead code.
             targets = (list(report.take_profit_targets) if report.take_profit_targets else [
-                round(report.entry_price * (1 + self.config["take_profit"]["t1_pct"] / 100), 2),
-                round(report.entry_price * (1 + self.config["take_profit"]["t2_pct"] / 100), 2),
-                round(report.entry_price * (1 + self.config["take_profit"]["t3_pct"] / 100), 2),
+                round(report.entry_price * (1 - self.config["take_profit"]["t1_pct"] / 100), 2),
+                round(report.entry_price * (1 - self.config["take_profit"]["t2_pct"] / 100), 2),
+                round(report.entry_price * (1 - self.config["take_profit"]["t3_pct"] / 100), 2),
             ])
 
             from src.decision.signal_generator import TradeSignal

@@ -919,11 +919,19 @@ class OrderManager:
                 self.portfolio.day_start_date = _today_str
             await self.portfolio._save_state()
 
+            # Short economics: stop sits ABOVE entry (protects against price rising),
+            # take-profit targets sit BELOW entry (profit comes from price falling) --
+            # fixed 2026-08-28, audit finding. This reconciliation branch had never
+            # been updated to this project's own short-direction convention (confirmed
+            # correct at ~15 other sites in this codebase), so a position discovered
+            # here got a stop BELOW current price and targets ABOVE it -- the exact
+            # inverse of what a short needs -- which the next sync_exit_orders pass
+            # could misread as an already-breached stop and wrongly liquidate.
             tp_cfg = self.config.get("take_profit", {})
-            sl_mult = 1 - tp_cfg.get("stop_loss_pct", 5.0) / 100
-            t1_mult = 1 + tp_cfg.get("t1_pct",  5.0) / 100
-            t2_mult = 1 + tp_cfg.get("t2_pct", 10.0) / 100
-            t3_mult = 1 + tp_cfg.get("t3_pct", 17.0) / 100
+            sl_mult = 1 + tp_cfg.get("stop_loss_pct", 5.0) / 100
+            t1_mult = 1 - tp_cfg.get("t1_pct",  5.0) / 100
+            t2_mult = 1 - tp_cfg.get("t2_pct", 10.0) / 100
+            t3_mult = 1 - tp_cfg.get("t3_pct", 17.0) / 100
 
             positions = await self.broker.get_positions()
             for p in positions:
