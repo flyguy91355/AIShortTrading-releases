@@ -1319,6 +1319,44 @@ def _required_rr(conviction: int, min_conviction: int, base_rr: float, step: flo
     return max(floor, base_rr - extra_conviction * step)
 
 
+def compute_bounded_rr(
+    risk: float, reward: float, atr_pct: float,
+    stop_atr_min_mult: float, reward_atr_max_mult: float,
+) -> float:
+    """R/R with both sides bounded to this ticker's own recent volatility (2026-08-28,
+    volatility-bounded R/R design -- see docs/superpowers/specs/2026-08-28-volatility-
+    bounded-rr-design.md for the incident this fixes: a real scan of 1,500+ tickers
+    produced zero qualifying candidates because R/R was computed from two fully
+    independent numbers with no volatility anchor, scattering it from -4.6 to +6.6
+    with almost nothing landing near any gate).
+
+    `risk` is floored at atr_pct * stop_atr_min_mult -- defense in depth alongside
+    _volatility_scaled_stop_bounds' own clamp on the REAL stop-placement value (this
+    catches a stale cached report from before that fix, or an install with
+    ai_chosen_stop_tp_enabled off, where the real stop is a flat, non-volatility-aware
+    percentage). `reward` is capped at atr_pct * reward_atr_max_mult -- there is no
+    existing bound on the reward side anywhere else, so this is the only place an
+    outlier valuation gap gets tamed. A negative reward (a genuinely weak or
+    contradictory setup) is left untouched -- the cap only ever lowers an excessive
+    positive value, never raises a negative one.
+
+    Falls back to the plain, unbounded ratio when atr_pct <= 0 (matches every other
+    market-data-dependent guard in this codebase's fail-toward-prior-behavior
+    convention) -- identical to every inline `reward / risk` this function replaces,
+    for any candidate this project doesn't yet have volatility data for.
+
+    risk <= 0 returns 0.0, matching the convention every existing inline call site
+    already used before this fix. Callers are responsible for supplying risk/reward
+    already correctly signed for their own economics (short: risk = stop - entry,
+    reward = entry - fair_value) -- this function has no direction of its own."""
+    if risk <= 0:
+        return 0.0
+    if atr_pct > 0:
+        risk = max(risk, atr_pct * stop_atr_min_mult)
+        reward = min(reward, atr_pct * reward_atr_max_mult)
+    return reward / risk
+
+
 def _yf_interval_and_period_for_days(days: int) -> tuple[str, str]:
     """Picks the finest intraday granularity yfinance actually supports for the requested
     window, falling back to coarser bars once the window exceeds each granularity's own
@@ -5266,7 +5304,12 @@ class DashboardState:
             risk = stop_loss - entry_price
             if risk <= 0:
                 continue
-            rr = (entry_price - fair_value) / risk
+            atr_pct = d.get("atr_pct", 0.0)
+            rr = compute_bounded_rr(
+                risk, entry_price - fair_value, atr_pct,
+                self.config["research"].get("stop_atr_min_mult", 1.0),
+                self.config["research"].get("reward_atr_max_mult", 6.0),
+            )
             required_rr = _required_rr(conviction, min_conviction, base_rr, rr_step, rr_floor)
             if _on_deck_rr_floor_not_met(rr, required_rr, floor_margin):
                 continue
@@ -5290,6 +5333,7 @@ class DashboardState:
                 "conviction_score": conviction,
                 "fair_value_estimate": fair_value,
                 "margin_of_safety_pct": d.get("margin_of_safety_pct", 0.0),
+                "atr_pct": d.get("atr_pct", 0.0),
                 "last_price": entry_price,
                 "rr": rr,
                 "required_rr": required_rr,
@@ -5628,7 +5672,15 @@ class DashboardState:
                     stop = round(price * (1 + stop_pct / 100), 2)
                     fair_value = nm["fair_value_estimate"]
                     risk = stop - price
-                    rr = (price - fair_value) / risk if risk > 0 and fair_value > 0 else -999.0
+                    if risk > 0 and fair_value > 0:
+                        atr_pct = nm.get("atr_pct", 0.0)
+                        rr = compute_bounded_rr(
+                            risk, price - fair_value, atr_pct,
+                            self.config["research"].get("stop_atr_min_mult", 1.0),
+                            self.config["research"].get("reward_atr_max_mult", 6.0),
+                        )
+                    else:
+                        rr = -999.0
                     nm["rr"] = rr
                     nm["stop_loss"] = stop
                     # Conviction-scaled gate (2026-07-18), not one flat number for every
@@ -6426,6 +6478,7 @@ class DashboardState:
                 nm_snapshot["conviction_score"] = report.conviction_score
                 nm_snapshot["fair_value_estimate"] = report.fair_value_estimate
                 nm_snapshot["margin_of_safety_pct"] = report.margin_of_safety_pct
+                nm_snapshot["atr_pct"] = getattr(report, "atr_pct", 0.0)
                 if report.entry_price > 0:
                     nm_snapshot["last_price"] = report.entry_price
                 if report.entry_price > 0 and report.stop_loss > 0:
@@ -6463,7 +6516,14 @@ class DashboardState:
             # Short economics: stop sits above entry, reward is entry falling to fair_value.
             risk = report.stop_loss - report.entry_price
             fair_value = report.fair_value_estimate
-            rr = (report.entry_price - fair_value) / risk if risk > 0 and fair_value > 0 else 0.0
+            if risk > 0 and fair_value > 0:
+                rr = compute_bounded_rr(
+                    risk, report.entry_price - fair_value, getattr(report, "atr_pct", 0.0),
+                    self.config["research"].get("stop_atr_min_mult", 1.0),
+                    self.config["research"].get("reward_atr_max_mult", 6.0),
+                )
+            else:
+                rr = 0.0
             rr_step = self.config["research"].get("on_deck_rr_conviction_step", 0.1)
             rr_floor = self.config["research"].get("on_deck_rr_floor", 1.5)
             min_rr = _required_rr(report.conviction_score, min_conviction, base_rr, rr_step, rr_floor)
@@ -7184,7 +7244,15 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             return False, 0.0, base_rr
         # Short economics: stop sits above entry, reward is entry falling to fair_value.
         risk = report.stop_loss - report.entry_price
-        rr = (report.entry_price - report.fair_value_estimate) / risk if risk > 0 else 0
+        if risk > 0:
+            rr = compute_bounded_rr(
+                risk, report.entry_price - report.fair_value_estimate,
+                getattr(report, "atr_pct", 0.0),
+                self.config["research"].get("stop_atr_min_mult", 1.0),
+                self.config["research"].get("reward_atr_max_mult", 6.0),
+            )
+        else:
+            rr = 0
         required = _required_rr(report.conviction_score, min_conviction, base_rr, rr_step, rr_floor)
         return rr >= required, rr, required
 
@@ -7208,6 +7276,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             "conviction_score": report.conviction_score,
             "fair_value_estimate": report.fair_value_estimate,
             "margin_of_safety_pct": report.margin_of_safety_pct,
+            "atr_pct": getattr(report, "atr_pct", 0.0),
             "last_price": report.entry_price,
             "rr": rr_val,
             "required_rr": base_rr,  # placeholder — caller overwrites with the real value
@@ -7398,7 +7467,11 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             if entry_price <= 0 or stop_loss <= 0 or fair_value <= 0 or entry_price >= stop_loss:
                 return (False, float("-inf"))
             # Short economics: stop sits above entry, reward is entry falling to fair_value.
-            rr = (entry_price - fair_value) / (stop_loss - entry_price)
+            rr = compute_bounded_rr(
+                stop_loss - entry_price, entry_price - fair_value, d.get("atr_pct", 0.0),
+                self.config["research"].get("stop_atr_min_mult", 1.0),
+                self.config["research"].get("reward_atr_max_mult", 6.0),
+            )
             required_rr = _required_rr(
                 conviction, min_conviction,
                 self.config["research"]["min_risk_reward_ratio"],
@@ -7798,6 +7871,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
                 "conviction_score": r.get("conviction_score", 0),
                 "fair_value_estimate": r.get("fair_value_estimate", 0.0),
                 "margin_of_safety_pct": r.get("margin_of_safety_pct", 0.0),
+                "atr_pct": r.get("atr_pct", 0.0),
                 "last_price": r.get("last_price", 0.0),
                 "rr": r.get("rr", 0.0),
                 "required_rr": r.get("required_rr", 0.0),
@@ -7862,6 +7936,7 @@ Respond with ONLY the summary text, no preamble, no markdown."""
             "sector": getattr(report, "sector", ""),
             "fair_value_estimate": report.fair_value_estimate,
             "margin_of_safety_pct": report.margin_of_safety_pct,
+            "atr_pct": getattr(report, "atr_pct", 0.0),
             "generated_at": report.generated_at.isoformat(),
             "source": source,
             # Ported 2026-08-24 from AITrading, GitHub #81 -- report_data (the cached,
@@ -8935,6 +9010,9 @@ async def save_settings(payload: dict):
         "research.min_risk_reward_ratio": float,
         "research.on_deck_rr_floor_margin": lambda v: (float(v) if v not in ("", None) else None),
         "research.on_deck_rr_ceiling_margin": float,
+        "research.stop_atr_min_mult": float,
+        "research.stop_atr_max_mult": float,
+        "research.reward_atr_max_mult": float,
         "research.on_deck_rr_conviction_step": float,
         "research.on_deck_rr_floor": float,
         "research.watchlist_size": int,
@@ -9835,7 +9913,14 @@ async def get_today_scan_rejects():
         # Short economics: stop sits above live_price.
         live_stop = live_price * (1 + stop_pct / 100)
         risk = live_stop - live_price
-        rr = (live_price - fair_value) / risk if risk > 0 and fair_value > 0 else 0.0
+        if risk > 0 and fair_value > 0:
+            rr = compute_bounded_rr(
+                risk, live_price - fair_value, r.get("atr_pct", 0.0),
+                state.config["research"].get("stop_atr_min_mult", 1.0),
+                state.config["research"].get("reward_atr_max_mult", 6.0),
+            )
+        else:
+            rr = 0.0
         required_rr = _required_rr(conviction, min_conviction, base_rr, rr_step, rr_floor)
         margin = r.get("margin_of_safety_pct", 0.0) or 0.0
         score = conviction + margin / 10 + (rr - required_rr) * 2
