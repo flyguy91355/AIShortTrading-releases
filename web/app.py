@@ -6315,6 +6315,28 @@ class DashboardState:
         try:
             if not self.config["trading"].get("auto_execute", False) or not self.broker_connected:
                 return
+            # Not-yet-open gate (2026-08-28, ported from AITrading the same day --
+            # JNJ/RRC premarket-fill incident) -- the symmetric counterpart to the
+            # auto-buy cutoff below, which only ever guarded the LATE side of the
+            # trading day. The SMA Track 2 override (both the confirmed-cross
+            # merged-call path and the approaching-a-cross scan) can call this
+            # function during the pre-open batch, well before the exchange opens --
+            # AITrading live-caught this exact gap: JNJ and RRC were both bought,
+            # analyzed and submitted against a real, live PREMARKET quote (not
+            # stale/cached data), but a market order can't fill before 9:30 AM
+            # regardless, so Alpaca queued both for over an hour and filled them
+            # against the real opening print instead -- 0.5-0.7% away from the
+            # premarket price that exact re-analysis reasoned about. Confirmed this
+            # program shares the identical 3-call-site shape before porting. Checked
+            # first (cheapest possible gate) so a premarket call never pays for the
+            # real Claude re-analysis below.
+            if not self._is_market_open():
+                await _fail_gate(
+                    "R/R + rollover confirmed but market isn't open yet — skipping "
+                    "(a buy must be priced off live regular-hours data, not a "
+                    "premarket quote)",
+                    "Market not yet open")
+                return
             # Auto-buy cutoff, now a real Settings value (2026-07-20, moved from a hardcoded
             # 2:00 PM) — read fresh from config each call rather than parsed once at startup,
             # matching the pattern most other settings already use, so a change takes effect
